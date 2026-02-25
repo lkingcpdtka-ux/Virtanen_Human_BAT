@@ -24,14 +24,15 @@ CONDITION_COL      <- "tissue"    # column name in colData
 CONDITION_REF      <- "WAT"       # reference level (denominator)
 CONDITION_TEST     <- "BAT"       # test level (numerator)
 SUBJECT_COL        <- "subject"   # for paired design
+SUBJECTS_TO_EXCLUDE <- NULL       # e.g. c("SubjectName") after PCA review
 
 ## ---- DE thresholds (from paper) --------------------------
 PADJ_CUTOFF        <- 0.05
 LFC_CUTOFF         <- 1.0         # log2 fold-change >= 1
 
 ## ---- Expected DEG counts (paper Table S1 / Figure 1) ----
-EXPECTED_UP_BAT    <- 847         # genes higher in BAT
-EXPECTED_UP_WAT    <- 928         # genes higher in WAT
+EXPECTED_UP_BAT    <- 463         # paper: 463 BAT-enriched genes (14 subjects)
+EXPECTED_UP_WAT    <- 928         # genes higher in WAT (paper does not specify)
 DEG_COUNT_TOLERANCE <- 0.20       # allow 20% deviation
 
 ## ---- BAT marker genes (from paper) ----------------------

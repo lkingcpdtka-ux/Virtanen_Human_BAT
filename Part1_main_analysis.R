@@ -507,6 +507,16 @@ tryCatch({
   subj_tab <- sort(table(se$subject), decreasing = TRUE)
   print(head(subj_tab, 10))
 
+  ## Exclude subjects if specified (to match paper's 14-subject cohort)
+  if (exists("SUBJECTS_TO_EXCLUDE") && !is.null(SUBJECTS_TO_EXCLUDE) &&
+      length(SUBJECTS_TO_EXCLUDE) > 0) {
+    keep_subj <- !(se$subject %in% SUBJECTS_TO_EXCLUDE)
+    cat("[FILTER] Excluding subjects:", paste(SUBJECTS_TO_EXCLUDE, collapse = ", "),
+        "->", sum(keep_subj), "of", ncol(se), "samples remain\n")
+    se <- se[, keep_subj]
+    se$subject <- droplevels(se$subject)
+  }
+
   sanity$n_genes_raw   <- nrow(se)
   sanity$n_samples     <- ncol(se)
   sanity$n_subjects    <- nlevels(se$subject)
@@ -608,6 +618,17 @@ tryCatch({
   sanity$n_up_wat <- sum(res_df$padj < PADJ_CUTOFF &
                           res_df$log2FoldChange <= -LFC_CUTOFF, na.rm = TRUE)
 
+  ## Compare to paper
+  cat("[PAPER] Virtanen et al. report", EXPECTED_UP_BAT,
+      "BAT-enriched genes (14 subjects)\n")
+  cat("[PAPER] This run:", sanity$n_up_bat, "BAT-enriched genes (",
+      nlevels(se_filt$subject), "subjects)\n")
+  if (abs(sanity$n_up_bat - EXPECTED_UP_BAT) / EXPECTED_UP_BAT <= DEG_COUNT_TOLERANCE) {
+    cat("[PAPER] Within", DEG_COUNT_TOLERANCE * 100, "% tolerance\n")
+  } else {
+    cat("[PAPER] Outside tolerance — may reflect different subject count or filtering\n")
+  }
+
   ## ---- 4.4) Gene symbol mapping --------------------------
   cat("\n== 4.4  Mapping gene IDs to symbols ==\n")
 
@@ -688,6 +709,52 @@ tryCatch({
     } else {
       cat("  >>> VERDICT: INCONCLUSIVE (NA values in results)\n")
       sanity$cldn1_verdict <- "INCONCLUSIVE"
+    }
+  }
+
+  cat("\n##########################################################\n\n")
+
+  ## ---- 4.5b) UCP1 — positive control ----------------------
+  cat("\n")
+  cat("##########################################################\n")
+  cat("##  CONTROL: UCP1 expression (canonical BAT marker)     ##\n")
+  cat("##########################################################\n\n")
+
+  ucp1_row <- res_df[res_df$symbol == "UCP1", ]
+
+  if (nrow(ucp1_row) == 0) {
+    cat("[!!] UCP1 NOT FOUND — this is unexpected for BAT/WAT data\n")
+    sanity$ucp1_found   <- FALSE
+    sanity$ucp1_verdict <- "NOT_DETECTED"
+  } else {
+    ucp1 <- ucp1_row[1, ]
+    cat("  Gene ID      :", ucp1$gene_id, "\n")
+    cat("  Symbol       : UCP1\n")
+    cat("  log2FC (BAT/WAT):", round(ucp1$log2FoldChange, 3), "\n")
+    cat("  p-value      :", signif(ucp1$pvalue, 4), "\n")
+    cat("  padj (BH)    :", signif(ucp1$padj, 4), "\n")
+    cat("  baseMean     :", round(ucp1$baseMean, 1), "\n\n")
+
+    sanity$ucp1_found    <- TRUE
+    sanity$ucp1_lfc      <- ucp1$log2FoldChange
+    sanity$ucp1_padj     <- ucp1$padj
+    sanity$ucp1_baseMean <- ucp1$baseMean
+
+    if (!is.na(ucp1$padj) && ucp1$padj < PADJ_CUTOFF &&
+        ucp1$log2FoldChange > 0) {
+      cat("  >>> CONTROL PASS: UCP1 is SIGNIFICANTLY UP in BAT\n")
+      if (ucp1$log2FoldChange >= LFC_CUTOFF) {
+        cat("      (meets both padj and log2FC thresholds)\n")
+      } else {
+        cat("      (significant but below LFC cutoff of", LFC_CUTOFF, ")\n")
+      }
+      sanity$ucp1_verdict <- "UP_IN_BAT_SIGNIFICANT"
+    } else if (!is.na(ucp1$log2FoldChange) && ucp1$log2FoldChange > 0) {
+      cat("  >>> CONTROL WARNING: UCP1 trends up but is not significant\n")
+      sanity$ucp1_verdict <- "UP_TREND_NOT_SIGNIFICANT"
+    } else {
+      cat("  >>> CONTROL WARNING: UCP1 not up in BAT — check data integrity\n")
+      sanity$ucp1_verdict <- "UNEXPECTED"
     }
   }
 
@@ -783,6 +850,13 @@ tryCatch({
   cat("[SAVED]", cldn1_file, "\n")
   verify_output_file(file.path(outdir, "tables", cldn1_file), "CLDN1 CSV")
 
+  ## UCP1-specific table
+  ucp1_file <- paste0("UCP1_result_", run_tag, ".csv")
+  write.csv(ucp1_row, file = file.path(outdir, "tables", ucp1_file),
+            row.names = FALSE)
+  cat("[SAVED]", ucp1_file, "\n")
+  verify_output_file(file.path(outdir, "tables", ucp1_file), "UCP1 CSV")
+
   ## Authoritative DEG lists for downstream scripts
   deg_lists <- list(
     up_in_BAT = deg_df %>% filter(log2FoldChange > 0) %>% pull(symbol),
@@ -838,14 +912,17 @@ tryCatch({
     cat("[SAVED]", volcano_file, "\n")
     verify_output_file(file.path(outdir, "plots", volcano_file), "Volcano plot")
 
-    ## -- 4.9b) PCA --
-    cat("[PLOT] PCA\n")
+    ## -- 4.9b) PCA (with subject labels for outlier identification) --
+    cat("[PLOT] PCA biplot (subject-labelled)\n")
 
-    pca_data <- plotPCA(vsd, intgroup = c("tissue"), returnData = TRUE)
+    pca_data <- plotPCA(vsd, intgroup = c("tissue", "subject"), returnData = TRUE)
     pct_var  <- round(100 * attr(pca_data, "percentVar"))
 
-    p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, colour = tissue)) +
+    p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, colour = tissue,
+                                   label = subject)) +
       geom_point(size = 4, alpha = 0.8) +
+      ggrepel::geom_text_repel(size = 3, max.overlaps = 20,
+                                show.legend = FALSE) +
       scale_colour_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
       labs(
         title = "PCA: BAT vs WAT (Virtanen 2018)",
@@ -897,6 +974,88 @@ tryCatch({
       verify_output_file(file.path(outdir, "plots", cldn1_plot_file), "CLDN1 boxplot")
     } else {
       cat("[SKIP] CLDN1 not in VST matrix — cannot plot\n")
+    }
+
+    ## -- 4.9c2) UCP1 expression box plot (positive control) --
+    cat("[PLOT] UCP1 per-sample boxplot\n")
+
+    ucp1_id <- res_df$gene_id[res_df$symbol == "UCP1"]
+    if (length(ucp1_id) > 0 && ucp1_id[1] %in% rownames(vst_mat)) {
+      ucp1_vst <- data.frame(
+        expression = vst_mat[ucp1_id[1], ],
+        tissue     = colData(dds)$tissue,
+        subject    = colData(dds)$subject
+      )
+
+      p_ucp1 <- ggplot(ucp1_vst, aes(x = tissue, y = expression, fill = tissue)) +
+        geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+        geom_line(aes(group = subject), colour = "grey50", linewidth = 0.4) +
+        geom_point(aes(colour = tissue), size = 3) +
+        scale_fill_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
+        scale_colour_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
+        labs(
+          title    = "UCP1 Expression: BAT vs WAT (Positive Control)",
+          subtitle = paste0("log2FC = ", round(ucp1_row$log2FoldChange[1], 2),
+                            ", padj = ", signif(ucp1_row$padj[1], 3)),
+          y = "VST-normalised expression", x = NULL
+        ) +
+        theme_bw(base_size = 14) + theme(legend.position = "none")
+
+      ucp1_plot_file <- paste0("UCP1_boxplot_BAT_vs_WAT_", run_tag, ".png")
+      ggsave(file.path(outdir, "plots", ucp1_plot_file), plot = p_ucp1,
+             width = 5, height = 6, dpi = PLOT_DPI)
+      cat("[SAVED]", ucp1_plot_file, "\n")
+      verify_output_file(file.path(outdir, "plots", ucp1_plot_file), "UCP1 boxplot")
+    } else {
+      cat("[SKIP] UCP1 not in VST matrix — cannot plot\n")
+    }
+
+    ## -- 4.9c3) Correlation: CLDN1 vs UCP1 in BAT samples --
+    cat("[PLOT] CLDN1 vs UCP1 Spearman correlation (BAT only)\n")
+
+    cor_cldn1_id <- res_df$gene_id[res_df$symbol == "CLDN1"][1]
+    cor_ucp1_id  <- res_df$gene_id[res_df$symbol == "UCP1"][1]
+
+    if (!is.na(cor_cldn1_id) && !is.na(cor_ucp1_id) &&
+        cor_cldn1_id %in% rownames(vst_mat) &&
+        cor_ucp1_id %in% rownames(vst_mat)) {
+
+      bat_idx <- which(colData(dds)$tissue == "BAT")
+      cor_df <- data.frame(
+        CLDN1   = vst_mat[cor_cldn1_id, bat_idx],
+        UCP1    = vst_mat[cor_ucp1_id,  bat_idx],
+        subject = colData(dds)$subject[bat_idx]
+      )
+
+      cor_test <- cor.test(cor_df$CLDN1, cor_df$UCP1, method = "spearman",
+                           exact = FALSE)
+      cat("[CORR] Spearman rho =", round(cor_test$estimate, 3),
+          ", p =", signif(cor_test$p.value, 3), "\n")
+
+      sanity$cldn1_ucp1_rho  <- cor_test$estimate
+      sanity$cldn1_ucp1_pval <- cor_test$p.value
+
+      p_cor <- ggplot(cor_df, aes(x = UCP1, y = CLDN1)) +
+        geom_point(colour = "#B2182B", size = 3) +
+        geom_smooth(method = "lm", se = TRUE, colour = "grey30",
+                    linewidth = 0.8) +
+        ggrepel::geom_text_repel(aes(label = subject), size = 2.5,
+                                  max.overlaps = 15) +
+        labs(
+          title = "CLDN1 vs UCP1 in BAT (Spearman)",
+          subtitle = paste0("rho = ", round(cor_test$estimate, 3),
+                            ", p = ", signif(cor_test$p.value, 3)),
+          x = "UCP1 (VST-normalised)", y = "CLDN1 (VST-normalised)"
+        ) +
+        theme_bw(base_size = 14)
+
+      cor_file <- paste0("CLDN1_vs_UCP1_BAT_correlation_", run_tag, ".png")
+      ggsave(file.path(outdir, "plots", cor_file), plot = p_cor,
+             width = 6, height = 6, dpi = PLOT_DPI)
+      cat("[SAVED]", cor_file, "\n")
+      verify_output_file(file.path(outdir, "plots", cor_file), "Correlation plot")
+    } else {
+      cat("[SKIP] CLDN1 or UCP1 not found — cannot compute correlation\n")
     }
 
     ## -- 4.9d) Heatmap of top DEGs with CLDN1 marked ------
@@ -1003,14 +1162,20 @@ tryCatch({
   cat("\n== 4.10  DEG summary ==\n")
 
   deg_summary <- data.frame(
-    contrast     = "BAT_vs_WAT",
-    n_tested     = nrow(res_df),
-    n_up_bat     = sanity$n_up_bat,
-    n_up_wat     = sanity$n_up_wat,
-    n_total_deg  = sanity$n_up_bat + sanity$n_up_wat,
-    cldn1_lfc    = ifelse(sanity$cldn1_found, round(sanity$cldn1_lfc, 4), NA),
-    cldn1_padj   = ifelse(sanity$cldn1_found, signif(sanity$cldn1_padj, 4), NA),
+    contrast      = "BAT_vs_WAT",
+    n_tested      = nrow(res_df),
+    n_up_bat      = sanity$n_up_bat,
+    n_up_wat      = sanity$n_up_wat,
+    n_total_deg   = sanity$n_up_bat + sanity$n_up_wat,
+    paper_up_bat  = EXPECTED_UP_BAT,
+    ucp1_lfc      = ifelse(isTRUE(sanity$ucp1_found), round(sanity$ucp1_lfc, 4), NA),
+    ucp1_padj     = ifelse(isTRUE(sanity$ucp1_found), signif(sanity$ucp1_padj, 4), NA),
+    ucp1_verdict  = ifelse(is.null(sanity$ucp1_verdict), NA, sanity$ucp1_verdict),
+    cldn1_lfc     = ifelse(sanity$cldn1_found, round(sanity$cldn1_lfc, 4), NA),
+    cldn1_padj    = ifelse(sanity$cldn1_found, signif(sanity$cldn1_padj, 4), NA),
     cldn1_verdict = sanity$cldn1_verdict,
+    cldn1_ucp1_rho = ifelse(!is.null(sanity$cldn1_ucp1_rho),
+                             round(sanity$cldn1_ucp1_rho, 4), NA),
     stringsAsFactors = FALSE
   )
 
@@ -1029,31 +1194,38 @@ tryCatch({
       "Samples loaded",
       "Subjects detected",
       "Genes after filtering",
-      "UCP1 up in BAT",
+      "BAT-enriched genes (paper: 463)",
+      "UCP1 verdict",
+      "UCP1 log2FC",
+      "UCP1 padj",
       "CLDN1 found",
-      "CLDN1 verdict"
+      "CLDN1 verdict",
+      "CLDN1 vs UCP1 rho (BAT)"
     ),
     expected = c(
       N_SAMPLES_EXPECTED,
       N_SUBJECTS,
       "> 10000",
+      paste0(EXPECTED_UP_BAT, " +/- ", DEG_COUNT_TOLERANCE * 100, "%"),
+      "UP_IN_BAT_SIGNIFICANT",
+      "> 0",
+      "< 0.05",
       "TRUE",
-      "TRUE",
-      "user-defined"
+      "user-defined",
+      "positive"
     ),
     observed = c(
       sanity$n_samples,
       sanity$n_subjects,
       sanity$n_genes_filtered,
-      {
-        ucp1 <- res_df[res_df$symbol == "UCP1", ]
-        if (nrow(ucp1) > 0) {
-          paste0(ucp1$log2FoldChange[1] > 0, " (LFC=",
-                 round(ucp1$log2FoldChange[1], 2), ")")
-        } else "NOT_FOUND"
-      },
+      sanity$n_up_bat,
+      ifelse(is.null(sanity$ucp1_verdict), "NA", sanity$ucp1_verdict),
+      ifelse(isTRUE(sanity$ucp1_found), round(sanity$ucp1_lfc, 3), "NOT_FOUND"),
+      ifelse(isTRUE(sanity$ucp1_found), signif(sanity$ucp1_padj, 4), "NOT_FOUND"),
       sanity$cldn1_found,
-      sanity$cldn1_verdict
+      sanity$cldn1_verdict,
+      ifelse(!is.null(sanity$cldn1_ucp1_rho),
+             round(sanity$cldn1_ucp1_rho, 3), "NA")
     ),
     stringsAsFactors = FALSE
   )
@@ -1070,7 +1242,9 @@ tryCatch({
   sink(session_file)
   cat("=== Session Info ===\n")
   cat("Run tag:", run_tag, "\n")
-  cat("CLDN1 verdict:", sanity$cldn1_verdict, "\n\n")
+  cat("CLDN1 verdict:", sanity$cldn1_verdict, "\n")
+  cat("UCP1  verdict:", ifelse(is.null(sanity$ucp1_verdict), "NA",
+                                sanity$ucp1_verdict), "\n\n")
   print(sessionInfo())
   sink()
   verify_output_file(session_file, "Session info")
@@ -1148,6 +1322,8 @@ cat("\n")
 cat("##########################################################\n")
 cat("##  DONE — Part 1 complete                              ##\n")
 cat("##  Run directory: ", basename(outdir), "\n", sep = "")
+cat("##  UCP1  verdict: ", ifelse(is.null(sanity$ucp1_verdict), "NA",
+                                   sanity$ucp1_verdict), "\n", sep = "")
 cat("##  CLDN1 verdict: ", sanity$cldn1_verdict, "\n", sep = "")
 cat("##########################################################\n")
 cat("End time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")

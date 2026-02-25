@@ -20,31 +20,77 @@ is_gzip_file <- function(path) {
   length(sig) == 2 && identical(as.integer(sig), c(31L, 139L))
 }
 
+prepare_text_input_file <- function(path, force_gzip = FALSE) {
+  raw_size <- file.info(path)$size
+  if (is.na(raw_size) || raw_size <= 0) {
+    stop("Count file is empty or unreadable: ", path)
+  }
+
+  con <- file(path, open = "rb")
+  on.exit(close(con), add = TRUE)
+  raw_bytes <- readBin(con, what = "raw", n = raw_size)
+
+  use_gzip <- isTRUE(force_gzip) || is_gzip_file(path)
+  if (use_gzip) {
+    raw_bytes <- tryCatch(memDecompress(raw_bytes, type = "gzip"),
+                          error = function(e) {
+                            stop("Could not decompress gzip count file: ", path,
+                                 " | ", conditionMessage(e))
+                          })
+  }
+
+  tmp <- tempfile(fileext = ".txt")
+  writeBin(raw_bytes, tmp)
+  return(tmp)
+}
+
 read_geo_counts_with_fallback <- function(path, is_gz = FALSE) {
-  is_gz <- isTRUE(is_gz) || is_gzip_file(path)
-  encodings <- c("UTF-8", "latin1", "unknown")
+  txt_path <- prepare_text_input_file(path, force_gzip = is_gz)
+  on.exit(unlink(txt_path), add = TRUE)
+
+  encodings <- c("UTF-8", "latin1", "CP1252", "unknown")
+  seps <- c("	", ",", ";")
+
+  preview_lines <- tryCatch(readLines(txt_path, n = 50, warn = FALSE),
+                            error = function(e) character(0))
 
   for (enc in encodings) {
-    con <- if (is_gz) gzfile(path, open = "rt", encoding = enc) else
-      file(path, open = "rt", encoding = enc)
+    for (sep in seps) {
+      skip_options <- c(0)
+      if (length(preview_lines) > 0) {
+        sep_hits <- which(vapply(preview_lines, function(z) {
+          if (is.na(z) || !nzchar(z)) return(FALSE)
+          pieces <- strsplit(z, split = sep, fixed = TRUE)[[1]]
+          length(pieces) >= 3
+        }, logical(1)))
+        if (length(sep_hits) > 0) skip_options <- unique(c(skip_options, sep_hits[1] - 1))
+      }
 
-    dat <- tryCatch(
-      read.delim(
-        con,
-        row.names = NULL,
-        check.names = FALSE,
-        stringsAsFactors = FALSE
-      ),
-      error = function(e) e,
-      finally = close(con)
-    )
+      for (skip_n in skip_options) {
+        dat <- tryCatch(
+          read.table(
+            txt_path,
+            header = TRUE,
+            sep = sep,
+            quote = "\"",
+            comment.char = "",
+            fill = TRUE,
+            check.names = FALSE,
+            stringsAsFactors = FALSE,
+            fileEncoding = enc,
+            skip = skip_n
+          ),
+          error = function(e) e
+        )
 
-    if (!inherits(dat, "error")) {
-      return(dat)
+        if (!inherits(dat, "error") && ncol(dat) >= 2) {
+          return(as.data.frame(dat, stringsAsFactors = FALSE))
+        }
+      }
     }
   }
 
-  stop("Unable to read GEO counts file with UTF-8/latin1 encoding fallbacks")
+  stop("Unable to read GEO counts file with delimiter/encoding fallbacks: ", basename(path))
 }
 
 verify_output_file <- function(path, label = "output", must_exist = TRUE) {
@@ -76,7 +122,7 @@ normalize_sample_id <- function(x) {
   gsub("[^a-z0-9]", "", x)
 }
 
-select_numeric_count_columns <- function(df, min_numeric_fraction = 0.95) {
+select_numeric_count_columns <- function(df, min_numeric_fraction = 0.5) {
   if (ncol(df) == 0) return(df)
 
   numeric_fraction <- vapply(df, function(col) {

@@ -464,6 +464,17 @@ tryCatch({
     colnames(counts_raw) <- sample_ids
     rownames(pdata) <- sample_ids
 
+    ## Diagnostic: show sample alignment so user can verify tissue assignment
+    cat("[DIAG] Sample alignment (first 6):\n")
+    diag_n <- min(6, ncol(counts_raw))
+    diag_df <- data.frame(
+      geo_id  = head(sample_ids, diag_n),
+      tissue  = head(as.character(pdata$tissue), diag_n),
+      subject = head(as.character(pdata$subject), diag_n),
+      stringsAsFactors = FALSE
+    )
+    print(diag_df, row.names = FALSE)
+
     ## Keep only BAT/WAT samples used in the contrast
     keep_samples <- !is.na(pdata$tissue) & pdata$tissue %in% c(CONDITION_REF, CONDITION_TEST)
     counts_raw <- counts_raw[, keep_samples, drop = FALSE]
@@ -522,7 +533,12 @@ tryCatch({
   int_max <- .Machine$integer.max
   n_overflow <- sum(counts_mat > int_max)
   if (n_overflow > 0) {
+    overflow_idx <- which(counts_mat > int_max, arr.ind = TRUE)
     cat("[SANITY] Capping", n_overflow, "count values above integer max at", int_max, "\n")
+    cat("[SANITY] Overflow in gene(s):",
+        paste(head(rownames(counts_mat)[overflow_idx[, 1]], 3), collapse = ", "), "\n")
+    cat("[SANITY] Overflow in sample(s):",
+        paste(head(colnames(counts_mat)[overflow_idx[, 2]], 3), collapse = ", "), "\n")
     counts_mat[counts_mat > int_max] <- int_max
   }
 
@@ -530,7 +546,15 @@ tryCatch({
   assay(se, "counts") <- counts_mat
 
   if (LOW_COUNT_FILTER) {
-    keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE, na.rm = TRUE) >= MIN_SAMPLES_DETECTED
+    ## Dynamic threshold: use smallest experimental group size if not set
+    min_group <- if (is.null(MIN_SAMPLES_DETECTED)) {
+      min(table(se$tissue))
+    } else {
+      MIN_SAMPLES_DETECTED
+    }
+    cat("[FILTER] Requiring >=", MIN_COUNTS_PER_GENE, "counts in >=",
+        min_group, "samples (smallest group size)\n")
+    keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE, na.rm = TRUE) >= min_group
     se_filt <- se[keep, ]
     cat("[FILTER] Kept", sum(keep), "of", nrow(se), "genes",
         "(removed", sum(!keep), ")\n")

@@ -18,8 +18,8 @@ STUDY_DESCRIPTION   <- paste(
 )
 
 ## ---- Sample information ----------------------------------
-N_SUBJECTS         <- 14
-N_SAMPLES_EXPECTED <- 28          # 14 BAT + 14 WAT (paired)
+N_SUBJECTS         <- 15            # GEO has 15; paper excluded 1 post-hoc
+N_SAMPLES_EXPECTED <- 30            # 15 BAT + 15 WAT (paired)
 CONDITION_COL      <- "tissue"    # column name in colData
 CONDITION_REF      <- "WAT"       # reference level (denominator)
 CONDITION_TEST     <- "BAT"       # test level (numerator)
@@ -84,8 +84,8 @@ HEATMAP_TOP_N      <- 50         # top N DEGs for heatmap
 HEATMAP_SCALE      <- "row"      # z-score scaling
 
 ## ---- QC thresholds ---------------------------------------
-MIN_COUNTS_PER_GENE  <- 10       # minimum total counts to keep gene
-MIN_SAMPLES_DETECTED <- 3        # gene must be detected in >= N samples
+MIN_COUNTS_PER_GENE  <- 10       # minimum counts per sample to consider gene "detected"
+MIN_SAMPLES_DETECTED <- NULL     # NULL = auto-detect smallest group size (recommended)
 LOW_COUNT_FILTER     <- TRUE     # apply low-count filtering
 
 ## ---- Annotation database ---------------------------------

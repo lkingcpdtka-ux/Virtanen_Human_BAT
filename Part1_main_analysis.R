@@ -131,19 +131,52 @@ normalize_sample_id <- function(x) {
   gsub("[^a-z0-9]", "", x)
 }
 
+coerce_numeric_like <- function(x) {
+  vals <- as.character(x)
+  vals <- gsub(",", "", vals, fixed = TRUE)
+  vals <- gsub("[^0-9eE+\\-.]", "", vals)
+  suppressWarnings(as.numeric(vals))
+}
+
 select_numeric_count_columns <- function(df, min_numeric_fraction = 0.5) {
   if (ncol(df) == 0) return(df)
 
+  cn <- colnames(df)
+  cn[is.na(cn)] <- ""
+
+  ## Prefer explicit sample-like columns if present (Virtanen BAT/WAT columns)
+  sample_like <- grepl("(BAT|WAT)$", cn, ignore.case = TRUE)
+  if (sum(sample_like) >= 6) {
+    out <- df[, sample_like, drop = FALSE]
+    for (j in seq_len(ncol(out))) out[[j]] <- coerce_numeric_like(out[[j]])
+
+    non_empty <- colSums(!is.na(out)) > 0
+    out <- out[, non_empty, drop = FALSE]
+
+    if (ncol(out) > 0) {
+      dropped <- cn[!sample_like]
+      if (length(dropped) > 0) {
+        cat("[SANITY] Dropping non-sample columns:", paste(dropped, collapse = ", "), "\n")
+      }
+      return(out)
+    }
+  }
+
   numeric_fraction <- vapply(df, function(col) {
-    vals <- suppressWarnings(as.numeric(as.character(col)))
+    vals <- coerce_numeric_like(col)
     mean(!is.na(vals), na.rm = TRUE)
   }, numeric(1))
 
   numeric_fraction[is.na(numeric_fraction)] <- 0
-
   keep <- numeric_fraction >= min_numeric_fraction
+
   if (!any(keep)) {
-    stop("No numeric-like columns detected in count table after removing gene column")
+    ranked <- sort(numeric_fraction, decreasing = TRUE)
+    top_names <- names(head(ranked, 10))
+    msg <- paste0("No numeric-like columns detected in count table after removing gene column. ",
+                  "Top candidate columns by numeric fraction: ",
+                  paste(sprintf("%s=%.2f", top_names, head(ranked, 10)), collapse = ", "))
+    stop(msg)
   }
 
   dropped <- names(df)[!keep]
@@ -152,9 +185,14 @@ select_numeric_count_columns <- function(df, min_numeric_fraction = 0.5) {
   }
 
   out <- df[, keep, drop = FALSE]
-  for (j in seq_len(ncol(out))) {
-    out[[j]] <- suppressWarnings(as.numeric(as.character(out[[j]])))
+  for (j in seq_len(ncol(out))) out[[j]] <- coerce_numeric_like(out[[j]])
+
+  non_empty <- colSums(!is.na(out)) > 0
+  out <- out[, non_empty, drop = FALSE]
+  if (ncol(out) == 0) {
+    stop("Count columns were detected but all converted values are NA after numeric coercion")
   }
+
   out
 }
 

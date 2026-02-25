@@ -124,14 +124,33 @@ tryCatch({
 
     if (length(count_file) > 0) {
       ## Read the first matching count file
+      ## NOTE: read WITHOUT row.names first — GEO files often have
+      ##       duplicate gene symbols that would crash read.delim().
       cat("[INFO] Reading supplementary count file:", basename(count_file[1]), "\n")
       if (grepl("\\.gz$", count_file[1])) {
         counts_raw <- read.delim(gzfile(count_file[1]),
-                                  row.names = 1, check.names = FALSE)
+                                  row.names = NULL, check.names = FALSE)
       } else {
         counts_raw <- read.delim(count_file[1],
-                                  row.names = 1, check.names = FALSE)
+                                  row.names = NULL, check.names = FALSE)
       }
+
+      ## First column is the gene identifier — pull it out
+      gene_col <- counts_raw[[1]]
+      counts_raw <- counts_raw[, -1, drop = FALSE]
+
+      ## Handle duplicates: sum counts for identical gene IDs
+      if (anyDuplicated(gene_col)) {
+        n_dup <- sum(duplicated(gene_col))
+        cat("[INFO] Found", n_dup, "duplicate gene names — aggregating by sum\n")
+        counts_raw <- as.data.frame(counts_raw)
+        counts_raw$..gene.. <- gene_col
+        counts_raw <- aggregate(. ~ ..gene.., data = counts_raw, FUN = sum)
+        gene_col   <- counts_raw$..gene..
+        counts_raw <- counts_raw[, colnames(counts_raw) != "..gene..", drop = FALSE]
+      }
+
+      rownames(counts_raw) <- gene_col
     } else {
       ## Fallback: use exprs() from the GEO Series Matrix
       cat("[INFO] No supplementary count file found; using Series Matrix expression data\n")
@@ -303,16 +322,17 @@ tryCatch({
       multiVals = "first"
     )
     res_df$symbol <- gene_symbols[res_df$gene_id_clean]
+    n_mapped <- sum(!is.na(res_df$symbol))
   } else {
-    ## Assume gene IDs are already symbols
+    ## Gene IDs are already symbols (e.g. GEO humanBATWAT.txt)
     res_df$symbol <- res_df$gene_id
+    n_mapped <- sum(res_df$symbol != "")
   }
 
   ## Fill NA symbols with gene_id
   res_df$symbol[is.na(res_df$symbol)] <- res_df$gene_id[is.na(res_df$symbol)]
 
-  cat("[OK] Mapped", sum(!is.na(gene_symbols)), "of",
-      nrow(res_df), "genes to HGNC symbols\n")
+  cat("[OK] Mapped", n_mapped, "of", nrow(res_df), "genes to HGNC symbols\n")
 
   ## ---- 4.5) CLDN1 — the primary question -----------------
   cat("\n")

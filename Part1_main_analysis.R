@@ -11,6 +11,219 @@
 cat("=== Part 1: Virtanen Human BAT — CLDN1 validation ===\n")
 cat("Start time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
 
+
+is_gzip_file <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  con <- file(path, open = "rb")
+  on.exit(close(con), add = TRUE)
+  sig <- readBin(con, what = "raw", n = 2)
+  length(sig) == 2 && identical(as.integer(sig), c(31L, 139L))
+}
+
+is_zip_file <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  con <- file(path, open = "rb")
+  on.exit(close(con), add = TRUE)
+  sig <- readBin(con, what = "raw", n = 4)
+  length(sig) == 4 && identical(as.integer(sig), c(80L, 75L, 3L, 4L))
+}
+
+prepare_text_input_file <- function(path, force_gzip = FALSE) {
+  raw_size <- file.info(path)$size
+  if (is.na(raw_size) || raw_size <= 0) {
+    stop("Count file is empty or unreadable: ", path)
+  }
+
+  if (is_zip_file(path)) {
+    zfiles <- unzip(path, list = TRUE)
+    if (nrow(zfiles) == 0) stop("ZIP file contains no entries: ", path)
+    entry <- zfiles$Name[1]
+    tmp_zip_dir <- tempfile("unzipped_counts_")
+    dir.create(tmp_zip_dir, recursive = TRUE, showWarnings = FALSE)
+    unzip(path, files = entry, exdir = tmp_zip_dir)
+    return(file.path(tmp_zip_dir, entry))
+  }
+
+  con <- file(path, open = "rb")
+  on.exit(close(con), add = TRUE)
+  raw_bytes <- readBin(con, what = "raw", n = raw_size)
+
+  use_gzip <- isTRUE(force_gzip) || is_gzip_file(path)
+  if (use_gzip) {
+    raw_bytes <- tryCatch(memDecompress(raw_bytes, type = "gzip"),
+                          error = function(e) {
+                            stop("Could not decompress gzip count file: ", path,
+                                 " | ", conditionMessage(e))
+                          })
+  }
+
+  tmp <- tempfile(fileext = ".txt")
+  writeBin(raw_bytes, tmp)
+  return(tmp)
+}
+
+read_geo_counts_with_fallback <- function(path, is_gz = FALSE) {
+  txt_path <- prepare_text_input_file(path, force_gzip = is_gz)
+  on.exit(unlink(txt_path, recursive = TRUE, force = TRUE), add = TRUE)
+
+  encodings <- c("UTF-8", "latin1", "CP1252", "UTF-16LE", "UTF-16BE", "unknown")
+  seps <- c("	", ",", ";")
+  skip_options <- c(0, 1, 2, 3, 4, 5, 10, 20)
+
+  for (enc in encodings) {
+    for (sep in seps) {
+      for (skip_n in skip_options) {
+        dat <- tryCatch(
+          suppressWarnings(
+            read.table(
+              txt_path,
+              header = TRUE,
+              sep = sep,
+              quote = "\"",
+              comment.char = "",
+              fill = TRUE,
+              check.names = FALSE,
+              stringsAsFactors = FALSE,
+              fileEncoding = enc,
+              skip = skip_n
+            )
+          ),
+          error = function(e) e
+        )
+
+        if (!inherits(dat, "error") && ncol(dat) >= 2 && nrow(dat) > 0) {
+          return(as.data.frame(dat, stringsAsFactors = FALSE))
+        }
+      }
+    }
+  }
+
+  stop("Unable to read GEO counts file with delimiter/encoding fallbacks: ", basename(path),
+       ". Please provide a plain text count table via LOCAL_COUNTS_PATH.")
+}
+
+verify_output_file <- function(path, label = "output", must_exist = TRUE) {
+  ok <- file.exists(path)
+  if (ok) {
+    size_bytes <- file.size(path)
+    cat(sprintf("[SAVE-CHECK] %-24s OK  %s (%.1f KB)\n",
+                label, basename(path), as.numeric(size_bytes) / 1024))
+    return(invisible(TRUE))
+  }
+
+  msg <- paste0("[SAVE-CHECK] ", label, " MISSING: ", path)
+  if (must_exist) stop(msg) else warning(msg)
+  invisible(FALSE)
+}
+
+print_run_structure_sanity <- function(outdir) {
+  cat("\n[SANITY] savepoint structure check\n")
+  expected <- c("tables", "plots", "logs", "cache")
+  for (d in expected) {
+    dpath <- file.path(outdir, d)
+    cat(sprintf("  - %-6s : %s\n", d, ifelse(dir.exists(dpath), "present", "MISSING")))
+  }
+}
+
+normalize_sample_id <- function(x) {
+  x <- as.character(x)
+  x <- tolower(x)
+  gsub("[^a-z0-9]", "", x)
+}
+
+coerce_numeric_like <- function(x) {
+  vals <- as.character(x)
+  vals <- gsub(",", "", vals, fixed = TRUE)
+  vals <- gsub("[^0-9eE+.-]", "", vals)
+  suppressWarnings(as.numeric(vals))
+}
+
+select_numeric_count_columns <- function(df, min_numeric_fraction = 0.5) {
+  if (ncol(df) == 0) return(df)
+
+  cn <- colnames(df)
+  cn[is.na(cn)] <- ""
+
+  ## Prefer explicit sample-like columns if present (Virtanen BAT/WAT columns)
+  sample_like <- grepl("(BAT|WAT)$", cn, ignore.case = TRUE)
+  if (sum(sample_like) >= 6) {
+    out <- df[, sample_like, drop = FALSE]
+    for (j in seq_len(ncol(out))) out[[j]] <- coerce_numeric_like(out[[j]])
+
+    non_empty <- colSums(!is.na(out)) > 0
+    out <- out[, non_empty, drop = FALSE]
+
+    if (ncol(out) > 0) {
+      dropped <- cn[!sample_like]
+      if (length(dropped) > 0) {
+        cat("[SANITY] Dropping non-sample columns:", paste(dropped, collapse = ", "), "\n")
+      }
+      return(out)
+    }
+  }
+
+  numeric_fraction <- vapply(df, function(col) {
+    vals <- coerce_numeric_like(col)
+    mean(!is.na(vals), na.rm = TRUE)
+  }, numeric(1))
+
+  numeric_fraction[is.na(numeric_fraction)] <- 0
+  keep <- numeric_fraction >= min_numeric_fraction
+
+  if (!any(keep)) {
+    ranked <- sort(numeric_fraction, decreasing = TRUE)
+    top_names <- names(head(ranked, 10))
+    msg <- paste0("No numeric-like columns detected in count table after removing gene column. ",
+                  "Top candidate columns by numeric fraction: ",
+                  paste(sprintf("%s=%.2f", top_names, head(ranked, 10)), collapse = ", "))
+    stop(msg)
+  }
+
+  dropped <- names(df)[!keep]
+  if (length(dropped) > 0) {
+    cat("[SANITY] Dropping non-count columns:", paste(dropped, collapse = ", "), "\n")
+  }
+
+  out <- df[, keep, drop = FALSE]
+  for (j in seq_len(ncol(out))) out[[j]] <- coerce_numeric_like(out[[j]])
+
+  non_empty <- colSums(!is.na(out)) > 0
+  out <- out[, non_empty, drop = FALSE]
+  if (ncol(out) == 0) {
+    stop("Count columns were detected but all converted values are NA after numeric coercion")
+  }
+
+  out
+}
+
+find_local_count_file <- function(geo_accession, workdir) {
+  if (exists("LOCAL_COUNTS_PATH") &&
+      !is.null(LOCAL_COUNTS_PATH) &&
+      !is.na(LOCAL_COUNTS_PATH) &&
+      nzchar(LOCAL_COUNTS_PATH)) {
+    explicit <- if (file.exists(LOCAL_COUNTS_PATH)) LOCAL_COUNTS_PATH else file.path(workdir, LOCAL_COUNTS_PATH)
+    if (file.exists(explicit)) {
+      cat("[INFO] Using LOCAL_COUNTS_PATH:", normalizePath(explicit, mustWork = FALSE), "\n")
+      return(explicit)
+    }
+    warning("[WARN] LOCAL_COUNTS_PATH was set but not found: ", LOCAL_COUNTS_PATH)
+  }
+
+  candidates <- list.files(
+    workdir,
+    pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv)(\\.gz)?$"),
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+
+  if (length(candidates) > 0) {
+    cat("[INFO] Found local count file candidate:", basename(candidates[1]), "\n")
+    return(candidates[1])
+  }
+
+  return(NULL)
+}
+
 ## ---- 1) Packages -----------------------------------------
 required_pkgs <- c(
   "DESeq2", "GEOquery", "SummarizedExperiment",
@@ -74,17 +287,24 @@ run_info <- list(
 
 ## ---- 3) Initialise run -----------------------------------
 run_ctx <- init_run(
-  script_name = run_info$script_name,
-  species     = run_info$species,
-  data_type   = run_info$data_type,
-  keywords    = run_info$keywords,
-  notes       = run_info$notes
+  script_name   = run_info$script_name,
+  species       = run_info$species,
+  data_type     = run_info$data_type,
+  keywords      = run_info$keywords,
+  notes         = run_info$notes,
+  message       = run_info$message,
+  mode          = SAVECORE_MODE,
+  run_tag       = SAVECORE_RUN_TAG,
+  savepoint_dir = file.path(getwd(), "savepoints")
 )
 
 outdir    <- run_ctx$outdir
 run_tag   <- run_ctx$run_tag
 cache_dir <- run_ctx$cache_dir
-cat("Run directory:", normalizePath(outdir, mustWork = FALSE), "\n\n")
+cat("Run directory:", normalizePath(outdir, mustWork = FALSE), "\n")
+cat("[SANITY] save_core mode:", SAVECORE_MODE, "| run_tag override:", ifelse(is.null(SAVECORE_RUN_TAG), "NULL", SAVECORE_RUN_TAG), "\n")
+print_run_structure_sanity(outdir)
+cat("\n")
 
 ## ---- 3.5) Analysis flags ---------------------------------
 set.seed(SEED)
@@ -110,40 +330,48 @@ tryCatch({
     gse <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, getGPL = FALSE)
     gse <- gse[[1]]
 
-    ## Try to get raw counts from supplementary files
+    ## Try local counts first; otherwise download GEO supplementary file
     supp_dir <- file.path(cache_dir, "geo_supp")
     dir.create(supp_dir, recursive = TRUE, showWarnings = FALSE)
 
-    supp_files <- getGEOSuppFiles(GEO_ACCESSION, baseDir = supp_dir,
-                                   makeDirectory = FALSE)
+    local_count_file <- find_local_count_file(GEO_ACCESSION, getwd())
+    count_file <- NULL
 
-    ## Look for count matrix in supplementary files
-    count_file <- rownames(supp_files)[grepl("count|raw|txt|csv",
-                                              rownames(supp_files),
-                                              ignore.case = TRUE)]
+    if (!is.null(local_count_file)) {
+      count_file <- local_count_file
+    } else {
+      supp_files <- getGEOSuppFiles(GEO_ACCESSION, baseDir = supp_dir,
+                                     makeDirectory = FALSE)
 
-    if (length(count_file) > 0) {
-      ## Read the first matching count file
-      ## NOTE: read WITHOUT row.names first — GEO files often have
-      ##       duplicate gene symbols that would crash read.delim().
-      cat("[INFO] Reading supplementary count file:", basename(count_file[1]), "\n")
-      if (grepl("\\.gz$", count_file[1])) {
-        counts_raw <- read.delim(gzfile(count_file[1]),
-                                  row.names = NULL, check.names = FALSE)
-      } else {
-        counts_raw <- read.delim(count_file[1],
-                                  row.names = NULL, check.names = FALSE)
+      count_candidates <- rownames(supp_files)[grepl("count|raw|humanBATWAT|txt|csv",
+                                                     rownames(supp_files),
+                                                     ignore.case = TRUE)]
+      if (length(count_candidates) > 0) {
+        count_file <- count_candidates[1]
+      }
+    }
+
+    if (!is.null(count_file)) {
+      cat("[INFO] Reading count file:", basename(count_file), "\n")
+      counts_raw <- read_geo_counts_with_fallback(
+        count_file,
+        is_gz = isTRUE(grepl("\\.gz$", count_file, ignore.case = TRUE))
+      )
+
+      if (ncol(counts_raw) < 2) {
+        stop("Count file appears malformed (fewer than 2 columns): ", count_file,
+             ". If this is a gzipped file without .gz extension, recompress/rename or set LOCAL_COUNTS_PATH correctly.")
       }
 
-      ## First column is the gene identifier — pull it out
+      ## First column is gene identifier; remaining columns should be counts
       gene_col <- counts_raw[[1]]
       counts_raw <- counts_raw[, -1, drop = FALSE]
+      counts_raw <- select_numeric_count_columns(as.data.frame(counts_raw))
 
-      ## Handle duplicates: sum counts for identical gene IDs
+      ## Handle duplicate gene IDs by summing counts
       if (anyDuplicated(gene_col)) {
         n_dup <- sum(duplicated(gene_col))
         cat("[INFO] Found", n_dup, "duplicate gene names — aggregating by sum\n")
-        counts_raw <- as.data.frame(counts_raw)
         counts_raw$..gene.. <- gene_col
         counts_raw <- aggregate(. ~ ..gene.., data = counts_raw, FUN = sum)
         gene_col   <- counts_raw$..gene..
@@ -151,9 +379,10 @@ tryCatch({
       }
 
       rownames(counts_raw) <- gene_col
+      cat("[SANITY] Count matrix dimensions after cleanup:", nrow(counts_raw), "x", ncol(counts_raw), "\n")
     } else {
       ## Fallback: use exprs() from the GEO Series Matrix
-      cat("[INFO] No supplementary count file found; using Series Matrix expression data\n")
+      cat("[INFO] No count file found; using Series Matrix expression data\n")
       counts_raw <- as.data.frame(exprs(gse))
     }
 
@@ -202,29 +431,49 @@ tryCatch({
     }
 
     ## Ensure column alignment between counts and metadata
-    common_samples <- intersect(colnames(counts_raw), rownames(pdata))
-    if (length(common_samples) == 0) {
-      ## Try matching by geo_accession
-      common_samples <- intersect(colnames(counts_raw), pdata$geo_accession)
-      if (length(common_samples) > 0) {
-        rownames(pdata) <- pdata$geo_accession
-      } else {
-        ## Last resort: match by order
-        cat("[WARN] Cannot match sample names; aligning by column order\n")
-        stopifnot(ncol(counts_raw) == nrow(pdata))
-        colnames(counts_raw) <- rownames(pdata)
-        common_samples <- rownames(pdata)
+    pdata$geo_accession <- as.character(pdata$geo_accession)
+    pdata_id <- ifelse(is.na(pdata$geo_accession) | pdata$geo_accession == "",
+                       rownames(pdata), pdata$geo_accession)
+    pdata_norm <- normalize_sample_id(pdata_id)
+    counts_norm <- normalize_sample_id(colnames(counts_raw))
+
+    map_idx <- match(counts_norm, pdata_norm)
+    matched <- !is.na(map_idx)
+
+    cat("[SANITY] Sample-name matching:", sum(matched), "of", length(counts_norm), "count columns matched to metadata\n")
+
+    if (sum(matched) < 2) {
+      ## Last resort: strict order match only if dimensions agree
+      cat("[WARN] Weak sample-name matching; attempting order-based fallback\n")
+      if (ncol(counts_raw) != nrow(pdata)) {
+        stop("Unable to align count columns to metadata: matched ", sum(matched),
+             ", ncol(counts_raw)=", ncol(counts_raw),
+             ", nrow(pdata)=", nrow(pdata),
+             ". Consider setting LOCAL_COUNTS_PATH to the correct file.")
       }
+      colnames(counts_raw) <- pdata_id
+      map_idx <- seq_len(nrow(pdata))
+      matched <- rep(TRUE, ncol(counts_raw))
     }
 
-    counts_raw <- counts_raw[, common_samples, drop = FALSE]
-    pdata      <- pdata[common_samples, , drop = FALSE]
+    counts_raw <- counts_raw[, matched, drop = FALSE]
+    map_idx <- map_idx[matched]
+    pdata <- pdata[map_idx, , drop = FALSE]
+
+    sample_ids <- pdata_id[map_idx]
+    colnames(counts_raw) <- sample_ids
+    rownames(pdata) <- sample_ids
+
+    ## Keep only BAT/WAT samples used in the contrast
+    keep_samples <- !is.na(pdata$tissue) & pdata$tissue %in% c(CONDITION_REF, CONDITION_TEST)
+    counts_raw <- counts_raw[, keep_samples, drop = FALSE]
+    pdata <- pdata[keep_samples, , drop = FALSE]
 
     ## Build SummarizedExperiment
     col_data <- DataFrame(
       tissue  = factor(pdata$tissue, levels = c(CONDITION_REF, CONDITION_TEST)),
       subject = factor(pdata$subject),
-      row.names = common_samples
+      row.names = rownames(pdata)
     )
 
     se <- SummarizedExperiment(
@@ -240,6 +489,12 @@ tryCatch({
       nrow(se), "genes x", ncol(se), "samples\n")
   cat("     Tissues:", paste(levels(se$tissue), collapse = " vs "), "\n")
   cat("     Subjects:", nlevels(se$subject), "\n")
+  cat("[SANITY] First 6 sample IDs:", paste(head(colnames(se), 6), collapse = ", "), "\n")
+  cat("[SANITY] Tissue counts:\n")
+  print(table(se$tissue, useNA = "ifany"))
+  cat("[SANITY] Subjects with paired samples (top 10):\n")
+  subj_tab <- sort(table(se$subject), decreasing = TRUE)
+  print(head(subj_tab, 10))
 
   sanity$n_genes_raw   <- nrow(se)
   sanity$n_samples     <- ncol(se)
@@ -251,15 +506,31 @@ tryCatch({
 
   counts_mat <- assay(se, "counts")
 
-  ## Ensure integer counts for DESeq2
-  if (!is.integer(counts_mat[1, 1])) {
-    counts_mat <- round(counts_mat)
-    storage.mode(counts_mat) <- "integer"
-    assay(se, "counts") <- counts_mat
+  ## Ensure finite non-negative integer-like counts for DESeq2
+  counts_mat <- as.matrix(counts_mat)
+  storage.mode(counts_mat) <- "numeric"
+
+  n_na_before <- sum(is.na(counts_mat) | !is.finite(counts_mat))
+  if (n_na_before > 0) {
+    cat("[SANITY] Replacing", n_na_before, "NA/Inf count values with 0 before filtering\n")
+    counts_mat[is.na(counts_mat) | !is.finite(counts_mat)] <- 0
   }
 
+  counts_mat[counts_mat < 0] <- 0
+  counts_mat <- round(counts_mat)
+
+  int_max <- .Machine$integer.max
+  n_overflow <- sum(counts_mat > int_max)
+  if (n_overflow > 0) {
+    cat("[SANITY] Capping", n_overflow, "count values above integer max at", int_max, "\n")
+    counts_mat[counts_mat > int_max] <- int_max
+  }
+
+  storage.mode(counts_mat) <- "integer"
+  assay(se, "counts") <- counts_mat
+
   if (LOW_COUNT_FILTER) {
-    keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE) >= MIN_SAMPLES_DETECTED
+    keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE, na.rm = TRUE) >= MIN_SAMPLES_DETECTED
     se_filt <- se[keep, ]
     cat("[FILTER] Kept", sum(keep), "of", nrow(se), "genes",
         "(removed", sum(!keep), ")\n")
@@ -458,6 +729,7 @@ tryCatch({
   write.csv(res_df, file = file.path(outdir, "tables", de_file),
             row.names = FALSE)
   cat("[SAVED]", de_file, "\n")
+  verify_output_file(file.path(outdir, "tables", de_file), "DE full CSV")
 
   ## DEG-only table
   deg_df <- res_df %>%
@@ -468,12 +740,14 @@ tryCatch({
   write.csv(deg_df, file = file.path(outdir, "tables", deg_file),
             row.names = FALSE)
   cat("[SAVED]", deg_file, "(", nrow(deg_df), "DEGs )\n")
+  verify_output_file(file.path(outdir, "tables", deg_file), "DEG CSV")
 
   ## CLDN1-specific table
   cldn1_file <- paste0("CLDN1_result_", run_tag, ".csv")
   write.csv(cldn1_row, file = file.path(outdir, "tables", cldn1_file),
             row.names = FALSE)
   cat("[SAVED]", cldn1_file, "\n")
+  verify_output_file(file.path(outdir, "tables", cldn1_file), "CLDN1 CSV")
 
   ## Authoritative DEG lists for downstream scripts
   deg_lists <- list(
@@ -484,12 +758,14 @@ tryCatch({
   deg_lists_file <- paste0("DEG_lists_authoritative_", run_tag, ".rds")
   saveRDS(deg_lists, file = file.path(outdir, "tables", deg_lists_file))
   cat("[SAVED]", deg_lists_file, "\n")
+  verify_output_file(file.path(outdir, "tables", deg_lists_file), "DEG list RDS")
 
   ## Save VST matrix for downstream parts
   vst_file <- paste0("VST_matrix_", run_tag, ".rds")
   saveRDS(list(vst_mat = vst_mat, col_data = colData(dds)),
           file = file.path(outdir, "tables", vst_file))
   cat("[SAVED]", vst_file, "\n")
+  verify_output_file(file.path(outdir, "tables", vst_file), "VST RDS")
 
   ## ---- 4.9) Plots ----------------------------------------
   if (GENERATE_PLOTS) {
@@ -526,6 +802,7 @@ tryCatch({
     ggsave(file.path(outdir, "plots", volcano_file), plot = volcano,
            width = VOLCANO_W, height = VOLCANO_H, dpi = PLOT_DPI)
     cat("[SAVED]", volcano_file, "\n")
+    verify_output_file(file.path(outdir, "plots", volcano_file), "Volcano plot")
 
     ## -- 4.9b) PCA --
     cat("[PLOT] PCA\n")
@@ -548,6 +825,7 @@ tryCatch({
     ggsave(file.path(outdir, "plots", pca_file), plot = p_pca,
            width = PCA_W, height = PCA_H, dpi = PLOT_DPI)
     cat("[SAVED]", pca_file, "\n")
+    verify_output_file(file.path(outdir, "plots", pca_file), "PCA plot")
 
     ## -- 4.9c) CLDN1 expression box plot (per-sample) --
     cat("[PLOT] CLDN1 per-sample boxplot\n")
@@ -582,6 +860,7 @@ tryCatch({
       ggsave(file.path(outdir, "plots", cldn1_plot_file), plot = p_cldn1,
              width = 5, height = 6, dpi = PLOT_DPI)
       cat("[SAVED]", cldn1_plot_file, "\n")
+      verify_output_file(file.path(outdir, "plots", cldn1_plot_file), "CLDN1 boxplot")
     } else {
       cat("[SKIP] CLDN1 not in VST matrix — cannot plot\n")
     }
@@ -634,6 +913,7 @@ tryCatch({
       )
       dev.off()
       cat("[SAVED]", heat_file, "\n")
+      verify_output_file(file.path(outdir, "plots", heat_file), "Top DEG heatmap")
     } else {
       cat("[SKIP] Too few DEGs for heatmap (", length(hm_ids), ")\n")
     }
@@ -671,6 +951,7 @@ tryCatch({
       ggsave(file.path(outdir, "plots", bar_file), plot = p_bar,
              width = 7, height = 5, dpi = PLOT_DPI)
       cat("[SAVED]", bar_file, "\n")
+      verify_output_file(file.path(outdir, "plots", bar_file), "Marker barplot")
     }
 
     ## Register hero plot
@@ -703,6 +984,7 @@ tryCatch({
   write.csv(deg_summary, file = file.path(outdir, "tables", deg_summary_file),
             row.names = FALSE)
   cat("[SAVED]", deg_summary_file, "\n")
+  verify_output_file(file.path(outdir, "tables", deg_summary_file), "DE summary CSV")
   print(deg_summary)
 
   ## ---- 4.11) Sanity check table --------------------------
@@ -746,6 +1028,7 @@ tryCatch({
   write.csv(sanity_df, file = file.path(outdir, "tables", sanity_file),
             row.names = FALSE)
   cat("[SAVED]", sanity_file, "\n")
+  verify_output_file(file.path(outdir, "tables", sanity_file), "Sanity CSV")
   print(sanity_df)
 
   ## ---- 4.12) Session info --------------------------------
@@ -756,6 +1039,7 @@ tryCatch({
   cat("CLDN1 verdict:", sanity$cldn1_verdict, "\n\n")
   print(sessionInfo())
   sink()
+  verify_output_file(session_file, "Session info")
 
   ## ---- 4.13) Parameter log -------------------------------
   params_lines <- c(
@@ -771,6 +1055,20 @@ tryCatch({
   )
   params_file <- file.path(outdir, "logs", paste0("params_", run_tag, ".txt"))
   writeLines(params_lines, con = params_file)
+  verify_output_file(params_file, "Params log")
+
+  if (use_save_core && exists("finalize_run")) {
+    finalize_run(
+      outdir,
+      status = "success",
+      summary_lines = c(
+        paste0("run_tag: ", run_tag),
+        paste0("cldn1_verdict: ", sanity$cldn1_verdict),
+        paste0("n_samples: ", sanity$n_samples),
+        paste0("n_total_deg: ", sanity$n_up_bat + sanity$n_up_wat)
+      )
+    )
+  }
 
 }, error = function(e) {
   ## ---- Error handler -------------------------------------
@@ -782,11 +1080,34 @@ tryCatch({
     con = file.path(outdir, "logs", err_file)
   )
   cat("[SAVED] Error log:", err_file, "\n")
+
+  if (use_save_core && exists("finalize_run")) {
+    finalize_run(
+      outdir,
+      status = "error",
+      summary_lines = c(
+        paste0("run_tag: ", run_tag),
+        paste0("error: ", conditionMessage(e))
+      )
+    )
+  }
 })
 
 ## ---- 5) Cleanup ------------------------------------------
 if (use_save_core && exists("dedupe")) {
   try(dedupe(outdir), silent = TRUE)
+}
+
+cat("\n[SANITY] Output inventory\n")
+tables_written <- list.files(file.path(outdir, "tables"), full.names = FALSE)
+plots_written  <- list.files(file.path(outdir, "plots"), full.names = FALSE)
+cat("  Tables:", length(tables_written), "files\n")
+if (length(tables_written) > 0) {
+  cat("   -", paste(head(tables_written, 10), collapse = "\n   - "), "\n")
+}
+cat("  Plots :", length(plots_written), "files\n")
+if (length(plots_written) > 0) {
+  cat("   -", paste(head(plots_written, 10), collapse = "\n   - "), "\n")
 }
 
 cat("\n")

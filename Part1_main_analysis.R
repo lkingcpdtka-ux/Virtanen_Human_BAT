@@ -11,6 +11,56 @@
 cat("=== Part 1: Virtanen Human BAT — CLDN1 validation ===\n")
 cat("Start time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
 
+
+read_geo_counts_with_fallback <- function(path, is_gz = FALSE) {
+  encodings <- c("UTF-8", "latin1", "unknown")
+
+  for (enc in encodings) {
+    con <- if (is_gz) gzfile(path, open = "rt", encoding = enc) else
+      file(path, open = "rt", encoding = enc)
+
+    dat <- tryCatch(
+      read.delim(
+        con,
+        row.names = NULL,
+        check.names = FALSE,
+        stringsAsFactors = FALSE
+      ),
+      error = function(e) e,
+      finally = close(con)
+    )
+
+    if (!inherits(dat, "error")) {
+      return(dat)
+    }
+  }
+
+  stop("Unable to read GEO counts file with UTF-8/latin1 encoding fallbacks")
+}
+
+verify_output_file <- function(path, label = "output", must_exist = TRUE) {
+  ok <- file.exists(path)
+  if (ok) {
+    size_bytes <- file.size(path)
+    cat(sprintf("[SAVE-CHECK] %-24s OK  %s (%.1f KB)\n",
+                label, basename(path), as.numeric(size_bytes) / 1024))
+    return(invisible(TRUE))
+  }
+
+  msg <- paste0("[SAVE-CHECK] ", label, " MISSING: ", path)
+  if (must_exist) stop(msg) else warning(msg)
+  invisible(FALSE)
+}
+
+print_run_structure_sanity <- function(outdir) {
+  cat("\n[SANITY] savepoint structure check\n")
+  expected <- c("tables", "plots", "logs", "cache")
+  for (d in expected) {
+    dpath <- file.path(outdir, d)
+    cat(sprintf("  - %-6s : %s\n", d, ifelse(dir.exists(dpath), "present", "MISSING")))
+  }
+}
+
 ## ---- 1) Packages -----------------------------------------
 required_pkgs <- c(
   "DESeq2", "GEOquery", "SummarizedExperiment",
@@ -74,17 +124,24 @@ run_info <- list(
 
 ## ---- 3) Initialise run -----------------------------------
 run_ctx <- init_run(
-  script_name = run_info$script_name,
-  species     = run_info$species,
-  data_type   = run_info$data_type,
-  keywords    = run_info$keywords,
-  notes       = run_info$notes
+  script_name   = run_info$script_name,
+  species       = run_info$species,
+  data_type     = run_info$data_type,
+  keywords      = run_info$keywords,
+  notes         = run_info$notes,
+  message       = run_info$message,
+  mode          = SAVECORE_MODE,
+  run_tag       = SAVECORE_RUN_TAG,
+  savepoint_dir = file.path(getwd(), "savepoints")
 )
 
 outdir    <- run_ctx$outdir
 run_tag   <- run_ctx$run_tag
 cache_dir <- run_ctx$cache_dir
-cat("Run directory:", normalizePath(outdir, mustWork = FALSE), "\n\n")
+cat("Run directory:", normalizePath(outdir, mustWork = FALSE), "\n")
+cat("[SANITY] save_core mode:", SAVECORE_MODE, "| run_tag override:", ifelse(is.null(SAVECORE_RUN_TAG), "NULL", SAVECORE_RUN_TAG), "\n")
+print_run_structure_sanity(outdir)
+cat("\n")
 
 ## ---- 3.5) Analysis flags ---------------------------------
 set.seed(SEED)
@@ -128,11 +185,9 @@ tryCatch({
       ##       duplicate gene symbols that would crash read.delim().
       cat("[INFO] Reading supplementary count file:", basename(count_file[1]), "\n")
       if (grepl("\\.gz$", count_file[1])) {
-        counts_raw <- read.delim(gzfile(count_file[1]),
-                                  row.names = NULL, check.names = FALSE)
+        counts_raw <- read_geo_counts_with_fallback(count_file[1], is_gz = TRUE)
       } else {
-        counts_raw <- read.delim(count_file[1],
-                                  row.names = NULL, check.names = FALSE)
+        counts_raw <- read_geo_counts_with_fallback(count_file[1], is_gz = FALSE)
       }
 
       ## First column is the gene identifier — pull it out
@@ -240,6 +295,12 @@ tryCatch({
       nrow(se), "genes x", ncol(se), "samples\n")
   cat("     Tissues:", paste(levels(se$tissue), collapse = " vs "), "\n")
   cat("     Subjects:", nlevels(se$subject), "\n")
+  cat("[SANITY] First 6 sample IDs:", paste(head(colnames(se), 6), collapse = ", "), "\n")
+  cat("[SANITY] Tissue counts:\n")
+  print(table(se$tissue, useNA = "ifany"))
+  cat("[SANITY] Subjects with paired samples (top 10):\n")
+  subj_tab <- sort(table(se$subject), decreasing = TRUE)
+  print(head(subj_tab, 10))
 
   sanity$n_genes_raw   <- nrow(se)
   sanity$n_samples     <- ncol(se)
@@ -458,6 +519,7 @@ tryCatch({
   write.csv(res_df, file = file.path(outdir, "tables", de_file),
             row.names = FALSE)
   cat("[SAVED]", de_file, "\n")
+  verify_output_file(file.path(outdir, "tables", de_file), "DE full CSV")
 
   ## DEG-only table
   deg_df <- res_df %>%
@@ -468,12 +530,14 @@ tryCatch({
   write.csv(deg_df, file = file.path(outdir, "tables", deg_file),
             row.names = FALSE)
   cat("[SAVED]", deg_file, "(", nrow(deg_df), "DEGs )\n")
+  verify_output_file(file.path(outdir, "tables", deg_file), "DEG CSV")
 
   ## CLDN1-specific table
   cldn1_file <- paste0("CLDN1_result_", run_tag, ".csv")
   write.csv(cldn1_row, file = file.path(outdir, "tables", cldn1_file),
             row.names = FALSE)
   cat("[SAVED]", cldn1_file, "\n")
+  verify_output_file(file.path(outdir, "tables", cldn1_file), "CLDN1 CSV")
 
   ## Authoritative DEG lists for downstream scripts
   deg_lists <- list(
@@ -484,12 +548,14 @@ tryCatch({
   deg_lists_file <- paste0("DEG_lists_authoritative_", run_tag, ".rds")
   saveRDS(deg_lists, file = file.path(outdir, "tables", deg_lists_file))
   cat("[SAVED]", deg_lists_file, "\n")
+  verify_output_file(file.path(outdir, "tables", deg_lists_file), "DEG list RDS")
 
   ## Save VST matrix for downstream parts
   vst_file <- paste0("VST_matrix_", run_tag, ".rds")
   saveRDS(list(vst_mat = vst_mat, col_data = colData(dds)),
           file = file.path(outdir, "tables", vst_file))
   cat("[SAVED]", vst_file, "\n")
+  verify_output_file(file.path(outdir, "tables", vst_file), "VST RDS")
 
   ## ---- 4.9) Plots ----------------------------------------
   if (GENERATE_PLOTS) {
@@ -526,6 +592,7 @@ tryCatch({
     ggsave(file.path(outdir, "plots", volcano_file), plot = volcano,
            width = VOLCANO_W, height = VOLCANO_H, dpi = PLOT_DPI)
     cat("[SAVED]", volcano_file, "\n")
+    verify_output_file(file.path(outdir, "plots", volcano_file), "Volcano plot")
 
     ## -- 4.9b) PCA --
     cat("[PLOT] PCA\n")
@@ -548,6 +615,7 @@ tryCatch({
     ggsave(file.path(outdir, "plots", pca_file), plot = p_pca,
            width = PCA_W, height = PCA_H, dpi = PLOT_DPI)
     cat("[SAVED]", pca_file, "\n")
+    verify_output_file(file.path(outdir, "plots", pca_file), "PCA plot")
 
     ## -- 4.9c) CLDN1 expression box plot (per-sample) --
     cat("[PLOT] CLDN1 per-sample boxplot\n")
@@ -582,6 +650,7 @@ tryCatch({
       ggsave(file.path(outdir, "plots", cldn1_plot_file), plot = p_cldn1,
              width = 5, height = 6, dpi = PLOT_DPI)
       cat("[SAVED]", cldn1_plot_file, "\n")
+      verify_output_file(file.path(outdir, "plots", cldn1_plot_file), "CLDN1 boxplot")
     } else {
       cat("[SKIP] CLDN1 not in VST matrix — cannot plot\n")
     }
@@ -634,6 +703,7 @@ tryCatch({
       )
       dev.off()
       cat("[SAVED]", heat_file, "\n")
+      verify_output_file(file.path(outdir, "plots", heat_file), "Top DEG heatmap")
     } else {
       cat("[SKIP] Too few DEGs for heatmap (", length(hm_ids), ")\n")
     }
@@ -671,6 +741,7 @@ tryCatch({
       ggsave(file.path(outdir, "plots", bar_file), plot = p_bar,
              width = 7, height = 5, dpi = PLOT_DPI)
       cat("[SAVED]", bar_file, "\n")
+      verify_output_file(file.path(outdir, "plots", bar_file), "Marker barplot")
     }
 
     ## Register hero plot
@@ -703,6 +774,7 @@ tryCatch({
   write.csv(deg_summary, file = file.path(outdir, "tables", deg_summary_file),
             row.names = FALSE)
   cat("[SAVED]", deg_summary_file, "\n")
+  verify_output_file(file.path(outdir, "tables", deg_summary_file), "DE summary CSV")
   print(deg_summary)
 
   ## ---- 4.11) Sanity check table --------------------------
@@ -746,6 +818,7 @@ tryCatch({
   write.csv(sanity_df, file = file.path(outdir, "tables", sanity_file),
             row.names = FALSE)
   cat("[SAVED]", sanity_file, "\n")
+  verify_output_file(file.path(outdir, "tables", sanity_file), "Sanity CSV")
   print(sanity_df)
 
   ## ---- 4.12) Session info --------------------------------
@@ -756,6 +829,7 @@ tryCatch({
   cat("CLDN1 verdict:", sanity$cldn1_verdict, "\n\n")
   print(sessionInfo())
   sink()
+  verify_output_file(session_file, "Session info")
 
   ## ---- 4.13) Parameter log -------------------------------
   params_lines <- c(
@@ -771,6 +845,20 @@ tryCatch({
   )
   params_file <- file.path(outdir, "logs", paste0("params_", run_tag, ".txt"))
   writeLines(params_lines, con = params_file)
+  verify_output_file(params_file, "Params log")
+
+  if (use_save_core && exists("finalize_run")) {
+    finalize_run(
+      outdir,
+      status = "success",
+      summary_lines = c(
+        paste0("run_tag: ", run_tag),
+        paste0("cldn1_verdict: ", sanity$cldn1_verdict),
+        paste0("n_samples: ", sanity$n_samples),
+        paste0("n_total_deg: ", sanity$n_up_bat + sanity$n_up_wat)
+      )
+    )
+  }
 
 }, error = function(e) {
   ## ---- Error handler -------------------------------------
@@ -782,11 +870,34 @@ tryCatch({
     con = file.path(outdir, "logs", err_file)
   )
   cat("[SAVED] Error log:", err_file, "\n")
+
+  if (use_save_core && exists("finalize_run")) {
+    finalize_run(
+      outdir,
+      status = "error",
+      summary_lines = c(
+        paste0("run_tag: ", run_tag),
+        paste0("error: ", conditionMessage(e))
+      )
+    )
+  }
 })
 
 ## ---- 5) Cleanup ------------------------------------------
 if (use_save_core && exists("dedupe")) {
   try(dedupe(outdir), silent = TRUE)
+}
+
+cat("\n[SANITY] Output inventory\n")
+tables_written <- list.files(file.path(outdir, "tables"), full.names = FALSE)
+plots_written  <- list.files(file.path(outdir, "plots"), full.names = FALSE)
+cat("  Tables:", length(tables_written), "files\n")
+if (length(tables_written) > 0) {
+  cat("   -", paste(head(tables_written, 10), collapse = "\n   - "), "\n")
+}
+cat("  Plots :", length(plots_written), "files\n")
+if (length(plots_written) > 0) {
+  cat("   -", paste(head(plots_written, 10), collapse = "\n   - "), "\n")
 }
 
 cat("\n")

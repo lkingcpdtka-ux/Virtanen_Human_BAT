@@ -506,15 +506,31 @@ tryCatch({
 
   counts_mat <- assay(se, "counts")
 
-  ## Ensure integer counts for DESeq2
-  if (!is.integer(counts_mat[1, 1])) {
-    counts_mat <- round(counts_mat)
-    storage.mode(counts_mat) <- "integer"
-    assay(se, "counts") <- counts_mat
+  ## Ensure finite non-negative integer-like counts for DESeq2
+  counts_mat <- as.matrix(counts_mat)
+  storage.mode(counts_mat) <- "numeric"
+
+  n_na_before <- sum(is.na(counts_mat) | !is.finite(counts_mat))
+  if (n_na_before > 0) {
+    cat("[SANITY] Replacing", n_na_before, "NA/Inf count values with 0 before filtering\n")
+    counts_mat[is.na(counts_mat) | !is.finite(counts_mat)] <- 0
   }
 
+  counts_mat[counts_mat < 0] <- 0
+  counts_mat <- round(counts_mat)
+
+  int_max <- .Machine$integer.max
+  n_overflow <- sum(counts_mat > int_max)
+  if (n_overflow > 0) {
+    cat("[SANITY] Capping", n_overflow, "count values above integer max at", int_max, "\n")
+    counts_mat[counts_mat > int_max] <- int_max
+  }
+
+  storage.mode(counts_mat) <- "integer"
+  assay(se, "counts") <- counts_mat
+
   if (LOW_COUNT_FILTER) {
-    keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE) >= MIN_SAMPLES_DETECTED
+    keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE, na.rm = TRUE) >= MIN_SAMPLES_DETECTED
     se_filt <- se[keep, ]
     cat("[FILTER] Kept", sum(keep), "of", nrow(se), "genes",
         "(removed", sum(!keep), ")\n")

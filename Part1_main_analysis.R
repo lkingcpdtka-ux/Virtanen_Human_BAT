@@ -20,10 +20,28 @@ is_gzip_file <- function(path) {
   length(sig) == 2 && identical(as.integer(sig), c(31L, 139L))
 }
 
+is_zip_file <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  con <- file(path, open = "rb")
+  on.exit(close(con), add = TRUE)
+  sig <- readBin(con, what = "raw", n = 4)
+  length(sig) == 4 && identical(as.integer(sig), c(80L, 75L, 3L, 4L))
+}
+
 prepare_text_input_file <- function(path, force_gzip = FALSE) {
   raw_size <- file.info(path)$size
   if (is.na(raw_size) || raw_size <= 0) {
     stop("Count file is empty or unreadable: ", path)
+  }
+
+  if (is_zip_file(path)) {
+    zfiles <- unzip(path, list = TRUE)
+    if (nrow(zfiles) == 0) stop("ZIP file contains no entries: ", path)
+    entry <- zfiles$Name[1]
+    tmp_zip_dir <- tempfile("unzipped_counts_")
+    dir.create(tmp_zip_dir, recursive = TRUE, showWarnings = FALSE)
+    unzip(path, files = entry, exdir = tmp_zip_dir)
+    return(file.path(tmp_zip_dir, entry))
   }
 
   con <- file(path, open = "rb")
@@ -46,51 +64,42 @@ prepare_text_input_file <- function(path, force_gzip = FALSE) {
 
 read_geo_counts_with_fallback <- function(path, is_gz = FALSE) {
   txt_path <- prepare_text_input_file(path, force_gzip = is_gz)
-  on.exit(unlink(txt_path), add = TRUE)
+  on.exit(unlink(txt_path, recursive = TRUE, force = TRUE), add = TRUE)
 
-  encodings <- c("UTF-8", "latin1", "CP1252", "unknown")
+  encodings <- c("UTF-8", "latin1", "CP1252", "UTF-16LE", "UTF-16BE", "unknown")
   seps <- c("	", ",", ";")
-
-  preview_lines <- tryCatch(readLines(txt_path, n = 50, warn = FALSE),
-                            error = function(e) character(0))
+  skip_options <- c(0, 1, 2, 3, 4, 5, 10, 20)
 
   for (enc in encodings) {
     for (sep in seps) {
-      skip_options <- c(0)
-      if (length(preview_lines) > 0) {
-        sep_hits <- which(vapply(preview_lines, function(z) {
-          if (is.na(z) || !nzchar(z)) return(FALSE)
-          pieces <- strsplit(z, split = sep, fixed = TRUE)[[1]]
-          length(pieces) >= 3
-        }, logical(1)))
-        if (length(sep_hits) > 0) skip_options <- unique(c(skip_options, sep_hits[1] - 1))
-      }
-
       for (skip_n in skip_options) {
         dat <- tryCatch(
-          read.table(
-            txt_path,
-            header = TRUE,
-            sep = sep,
-            quote = "\"",
-            comment.char = "",
-            fill = TRUE,
-            check.names = FALSE,
-            stringsAsFactors = FALSE,
-            fileEncoding = enc,
-            skip = skip_n
+          suppressWarnings(
+            read.table(
+              txt_path,
+              header = TRUE,
+              sep = sep,
+              quote = "\"",
+              comment.char = "",
+              fill = TRUE,
+              check.names = FALSE,
+              stringsAsFactors = FALSE,
+              fileEncoding = enc,
+              skip = skip_n
+            )
           ),
           error = function(e) e
         )
 
-        if (!inherits(dat, "error") && ncol(dat) >= 2) {
+        if (!inherits(dat, "error") && ncol(dat) >= 2 && nrow(dat) > 0) {
           return(as.data.frame(dat, stringsAsFactors = FALSE))
         }
       }
     }
   }
 
-  stop("Unable to read GEO counts file with delimiter/encoding fallbacks: ", basename(path))
+  stop("Unable to read GEO counts file with delimiter/encoding fallbacks: ", basename(path),
+       ". Please provide a plain text count table via LOCAL_COUNTS_PATH.")
 }
 
 verify_output_file <- function(path, label = "output", must_exist = TRUE) {

@@ -12,7 +12,16 @@ cat("=== Part 1: Virtanen Human BAT — CLDN1 validation ===\n")
 cat("Start time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
 
 
+is_gzip_file <- function(path) {
+  if (!file.exists(path)) return(FALSE)
+  con <- file(path, open = "rb")
+  on.exit(close(con), add = TRUE)
+  sig <- readBin(con, what = "raw", n = 2)
+  length(sig) == 2 && identical(as.integer(sig), c(31L, 139L))
+}
+
 read_geo_counts_with_fallback <- function(path, is_gz = FALSE) {
+  is_gz <- isTRUE(is_gz) || is_gzip_file(path)
   encodings <- c("UTF-8", "latin1", "unknown")
 
   for (enc in encodings) {
@@ -72,8 +81,10 @@ select_numeric_count_columns <- function(df, min_numeric_fraction = 0.95) {
 
   numeric_fraction <- vapply(df, function(col) {
     vals <- suppressWarnings(as.numeric(as.character(col)))
-    mean(!is.na(vals))
+    mean(!is.na(vals), na.rm = TRUE)
   }, numeric(1))
+
+  numeric_fraction[is.na(numeric_fraction)] <- 0
 
   keep <- numeric_fraction >= min_numeric_fraction
   if (!any(keep)) {
@@ -93,7 +104,10 @@ select_numeric_count_columns <- function(df, min_numeric_fraction = 0.95) {
 }
 
 find_local_count_file <- function(geo_accession, workdir) {
-  if (exists("LOCAL_COUNTS_PATH") && !is.null(LOCAL_COUNTS_PATH) && nzchar(LOCAL_COUNTS_PATH)) {
+  if (exists("LOCAL_COUNTS_PATH") &&
+      !is.null(LOCAL_COUNTS_PATH) &&
+      !is.na(LOCAL_COUNTS_PATH) &&
+      nzchar(LOCAL_COUNTS_PATH)) {
     explicit <- if (file.exists(LOCAL_COUNTS_PATH)) LOCAL_COUNTS_PATH else file.path(workdir, LOCAL_COUNTS_PATH)
     if (file.exists(explicit)) {
       cat("[INFO] Using LOCAL_COUNTS_PATH:", normalizePath(explicit, mustWork = FALSE), "\n")
@@ -248,8 +262,13 @@ tryCatch({
       cat("[INFO] Reading count file:", basename(count_file), "\n")
       counts_raw <- read_geo_counts_with_fallback(
         count_file,
-        is_gz = grepl("\\.gz$", count_file, ignore.case = TRUE)
+        is_gz = isTRUE(grepl("\\.gz$", count_file, ignore.case = TRUE))
       )
+
+      if (ncol(counts_raw) < 2) {
+        stop("Count file appears malformed (fewer than 2 columns): ", count_file,
+             ". If this is a gzipped file without .gz extension, recompress/rename or set LOCAL_COUNTS_PATH correctly.")
+      }
 
       ## First column is gene identifier; remaining columns should be counts
       gene_col <- counts_raw[[1]]

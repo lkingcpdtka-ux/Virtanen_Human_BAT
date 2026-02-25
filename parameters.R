@@ -103,4 +103,7 @@ VERBOSE            <- TRUE
 SAVECORE_MODE      <- "new"      # new | resume_latest | resume_tag
 SAVECORE_RUN_TAG   <- NULL       # used only when SAVECORE_MODE == "resume_tag"
 
+## ---- Optional local counts override ----------------------
+LOCAL_COUNTS_PATH  <- NULL       # e.g. "GSE113764_humanBATWAT.txt.gz"
+
 cat("[OK] parameters.R loaded for", STUDY_TITLE, "\n")

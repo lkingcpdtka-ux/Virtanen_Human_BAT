@@ -61,6 +61,62 @@ print_run_structure_sanity <- function(outdir) {
   }
 }
 
+normalize_sample_id <- function(x) {
+  x <- as.character(x)
+  x <- tolower(x)
+  gsub("[^a-z0-9]", "", x)
+}
+
+select_numeric_count_columns <- function(df, min_numeric_fraction = 0.95) {
+  if (ncol(df) == 0) return(df)
+
+  numeric_fraction <- vapply(df, function(col) {
+    vals <- suppressWarnings(as.numeric(as.character(col)))
+    mean(!is.na(vals))
+  }, numeric(1))
+
+  keep <- numeric_fraction >= min_numeric_fraction
+  if (!any(keep)) {
+    stop("No numeric-like columns detected in count table after removing gene column")
+  }
+
+  dropped <- names(df)[!keep]
+  if (length(dropped) > 0) {
+    cat("[SANITY] Dropping non-count columns:", paste(dropped, collapse = ", "), "\n")
+  }
+
+  out <- df[, keep, drop = FALSE]
+  for (j in seq_len(ncol(out))) {
+    out[[j]] <- suppressWarnings(as.numeric(as.character(out[[j]])))
+  }
+  out
+}
+
+find_local_count_file <- function(geo_accession, workdir) {
+  if (exists("LOCAL_COUNTS_PATH") && !is.null(LOCAL_COUNTS_PATH) && nzchar(LOCAL_COUNTS_PATH)) {
+    explicit <- if (file.exists(LOCAL_COUNTS_PATH)) LOCAL_COUNTS_PATH else file.path(workdir, LOCAL_COUNTS_PATH)
+    if (file.exists(explicit)) {
+      cat("[INFO] Using LOCAL_COUNTS_PATH:", normalizePath(explicit, mustWork = FALSE), "\n")
+      return(explicit)
+    }
+    warning("[WARN] LOCAL_COUNTS_PATH was set but not found: ", LOCAL_COUNTS_PATH)
+  }
+
+  candidates <- list.files(
+    workdir,
+    pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv)(\\.gz)?$"),
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+
+  if (length(candidates) > 0) {
+    cat("[INFO] Found local count file candidate:", basename(candidates[1]), "\n")
+    return(candidates[1])
+  }
+
+  return(NULL)
+}
+
 ## ---- 1) Packages -----------------------------------------
 required_pkgs <- c(
   "DESeq2", "GEOquery", "SummarizedExperiment",
@@ -167,38 +223,43 @@ tryCatch({
     gse <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, getGPL = FALSE)
     gse <- gse[[1]]
 
-    ## Try to get raw counts from supplementary files
+    ## Try local counts first; otherwise download GEO supplementary file
     supp_dir <- file.path(cache_dir, "geo_supp")
     dir.create(supp_dir, recursive = TRUE, showWarnings = FALSE)
 
-    supp_files <- getGEOSuppFiles(GEO_ACCESSION, baseDir = supp_dir,
-                                   makeDirectory = FALSE)
+    local_count_file <- find_local_count_file(GEO_ACCESSION, getwd())
+    count_file <- NULL
 
-    ## Look for count matrix in supplementary files
-    count_file <- rownames(supp_files)[grepl("count|raw|txt|csv",
-                                              rownames(supp_files),
-                                              ignore.case = TRUE)]
+    if (!is.null(local_count_file)) {
+      count_file <- local_count_file
+    } else {
+      supp_files <- getGEOSuppFiles(GEO_ACCESSION, baseDir = supp_dir,
+                                     makeDirectory = FALSE)
 
-    if (length(count_file) > 0) {
-      ## Read the first matching count file
-      ## NOTE: read WITHOUT row.names first — GEO files often have
-      ##       duplicate gene symbols that would crash read.delim().
-      cat("[INFO] Reading supplementary count file:", basename(count_file[1]), "\n")
-      if (grepl("\\.gz$", count_file[1])) {
-        counts_raw <- read_geo_counts_with_fallback(count_file[1], is_gz = TRUE)
-      } else {
-        counts_raw <- read_geo_counts_with_fallback(count_file[1], is_gz = FALSE)
+      count_candidates <- rownames(supp_files)[grepl("count|raw|humanBATWAT|txt|csv",
+                                                     rownames(supp_files),
+                                                     ignore.case = TRUE)]
+      if (length(count_candidates) > 0) {
+        count_file <- count_candidates[1]
       }
+    }
 
-      ## First column is the gene identifier — pull it out
+    if (!is.null(count_file)) {
+      cat("[INFO] Reading count file:", basename(count_file), "\n")
+      counts_raw <- read_geo_counts_with_fallback(
+        count_file,
+        is_gz = grepl("\\.gz$", count_file, ignore.case = TRUE)
+      )
+
+      ## First column is gene identifier; remaining columns should be counts
       gene_col <- counts_raw[[1]]
       counts_raw <- counts_raw[, -1, drop = FALSE]
+      counts_raw <- select_numeric_count_columns(as.data.frame(counts_raw))
 
-      ## Handle duplicates: sum counts for identical gene IDs
+      ## Handle duplicate gene IDs by summing counts
       if (anyDuplicated(gene_col)) {
         n_dup <- sum(duplicated(gene_col))
         cat("[INFO] Found", n_dup, "duplicate gene names — aggregating by sum\n")
-        counts_raw <- as.data.frame(counts_raw)
         counts_raw$..gene.. <- gene_col
         counts_raw <- aggregate(. ~ ..gene.., data = counts_raw, FUN = sum)
         gene_col   <- counts_raw$..gene..
@@ -206,9 +267,10 @@ tryCatch({
       }
 
       rownames(counts_raw) <- gene_col
+      cat("[SANITY] Count matrix dimensions after cleanup:", nrow(counts_raw), "x", ncol(counts_raw), "\n")
     } else {
       ## Fallback: use exprs() from the GEO Series Matrix
-      cat("[INFO] No supplementary count file found; using Series Matrix expression data\n")
+      cat("[INFO] No count file found; using Series Matrix expression data\n")
       counts_raw <- as.data.frame(exprs(gse))
     }
 
@@ -257,29 +319,49 @@ tryCatch({
     }
 
     ## Ensure column alignment between counts and metadata
-    common_samples <- intersect(colnames(counts_raw), rownames(pdata))
-    if (length(common_samples) == 0) {
-      ## Try matching by geo_accession
-      common_samples <- intersect(colnames(counts_raw), pdata$geo_accession)
-      if (length(common_samples) > 0) {
-        rownames(pdata) <- pdata$geo_accession
-      } else {
-        ## Last resort: match by order
-        cat("[WARN] Cannot match sample names; aligning by column order\n")
-        stopifnot(ncol(counts_raw) == nrow(pdata))
-        colnames(counts_raw) <- rownames(pdata)
-        common_samples <- rownames(pdata)
+    pdata$geo_accession <- as.character(pdata$geo_accession)
+    pdata_id <- ifelse(is.na(pdata$geo_accession) | pdata$geo_accession == "",
+                       rownames(pdata), pdata$geo_accession)
+    pdata_norm <- normalize_sample_id(pdata_id)
+    counts_norm <- normalize_sample_id(colnames(counts_raw))
+
+    map_idx <- match(counts_norm, pdata_norm)
+    matched <- !is.na(map_idx)
+
+    cat("[SANITY] Sample-name matching:", sum(matched), "of", length(counts_norm), "count columns matched to metadata\n")
+
+    if (sum(matched) < 2) {
+      ## Last resort: strict order match only if dimensions agree
+      cat("[WARN] Weak sample-name matching; attempting order-based fallback\n")
+      if (ncol(counts_raw) != nrow(pdata)) {
+        stop("Unable to align count columns to metadata: matched ", sum(matched),
+             ", ncol(counts_raw)=", ncol(counts_raw),
+             ", nrow(pdata)=", nrow(pdata),
+             ". Consider setting LOCAL_COUNTS_PATH to the correct file.")
       }
+      colnames(counts_raw) <- pdata_id
+      map_idx <- seq_len(nrow(pdata))
+      matched <- rep(TRUE, ncol(counts_raw))
     }
 
-    counts_raw <- counts_raw[, common_samples, drop = FALSE]
-    pdata      <- pdata[common_samples, , drop = FALSE]
+    counts_raw <- counts_raw[, matched, drop = FALSE]
+    map_idx <- map_idx[matched]
+    pdata <- pdata[map_idx, , drop = FALSE]
+
+    sample_ids <- pdata_id[map_idx]
+    colnames(counts_raw) <- sample_ids
+    rownames(pdata) <- sample_ids
+
+    ## Keep only BAT/WAT samples used in the contrast
+    keep_samples <- !is.na(pdata$tissue) & pdata$tissue %in% c(CONDITION_REF, CONDITION_TEST)
+    counts_raw <- counts_raw[, keep_samples, drop = FALSE]
+    pdata <- pdata[keep_samples, , drop = FALSE]
 
     ## Build SummarizedExperiment
     col_data <- DataFrame(
       tissue  = factor(pdata$tissue, levels = c(CONDITION_REF, CONDITION_TEST)),
       subject = factor(pdata$subject),
-      row.names = common_samples
+      row.names = rownames(pdata)
     )
 
     se <- SummarizedExperiment(

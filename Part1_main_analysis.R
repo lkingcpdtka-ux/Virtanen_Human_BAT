@@ -226,7 +226,7 @@ find_local_count_file <- function(geo_accession, workdir) {
 
 ## ---- 1) Packages -----------------------------------------
 required_pkgs <- c(
-  "DESeq2", "GEOquery", "SummarizedExperiment",
+  "DESeq2", "edgeR", "GEOquery", "SummarizedExperiment",
   "ggplot2", "ggrepel", "pheatmap", "RColorBrewer",
   "EnhancedVolcano", "org.Hs.eg.db", "AnnotationDbi",
   "dplyr", "tidyr", "tibble", "stringr"
@@ -546,15 +546,25 @@ tryCatch({
   assay(se, "counts") <- counts_mat
 
   if (LOW_COUNT_FILTER) {
-    ## Dynamic threshold: use smallest experimental group size if not set
-    min_group <- if (is.null(MIN_SAMPLES_DETECTED)) {
-      min(table(se$tissue))
+    ## Use edgeR::filterByExpr() — the bioinformatics gold standard.
+    ## It computes a CPM threshold calibrated to library size and group
+    ## structure, giving a principled gene set (~15-25 K for human RNA-seq).
+    if (requireNamespace("edgeR", quietly = TRUE)) {
+      cat("[FILTER] Using edgeR::filterByExpr() (recommended)\n")
+      design_group <- se$tissue
+      keep <- edgeR::filterByExpr(counts_mat, group = design_group,
+                                  min.count = MIN_COUNTS_PER_GENE)
     } else {
-      MIN_SAMPLES_DETECTED
+      ## Fallback: simple threshold with dynamic group size
+      min_group <- if (is.null(MIN_SAMPLES_DETECTED)) {
+        min(table(se$tissue))
+      } else {
+        MIN_SAMPLES_DETECTED
+      }
+      cat("[FILTER] edgeR not available; requiring >=", MIN_COUNTS_PER_GENE,
+          "counts in >=", min_group, "samples\n")
+      keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE, na.rm = TRUE) >= min_group
     }
-    cat("[FILTER] Requiring >=", MIN_COUNTS_PER_GENE, "counts in >=",
-        min_group, "samples (smallest group size)\n")
-    keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE, na.rm = TRUE) >= min_group
     se_filt <- se[keep, ]
     cat("[FILTER] Kept", sum(keep), "of", nrow(se), "genes",
         "(removed", sum(!keep), ")\n")

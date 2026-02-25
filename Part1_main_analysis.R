@@ -134,7 +134,7 @@ normalize_sample_id <- function(x) {
 coerce_numeric_like <- function(x) {
   vals <- as.character(x)
   vals <- gsub(",", "", vals, fixed = TRUE)
-  vals <- gsub("[^0-9eE+\\-.]", "", vals)
+  vals <- gsub("[^0-9eE+.-]", "", vals)
   suppressWarnings(as.numeric(vals))
 }
 

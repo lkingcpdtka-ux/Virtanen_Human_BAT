@@ -603,50 +603,17 @@ tryCatch({
   sanity$n_subjects    <- nlevels(se$subject)
   sanity$tissues       <- levels(se$tissue)
 
-  ## ---- 4.1b) Gene-ID pre-filter --------------------------
-  ## The GEO count file contains ~217K features including GenBank
-  ## accessions (AK/BC/...), RefSeq IDs, and other non-standard
-  ## identifiers.  The paper used Genomatix which would have mapped
-  ## only to coding genes.  Strip non-standard IDs to approximate
-  ## what the paper actually analysed.
-  cat("\n== 4.1b  Gene-ID pre-filter ==\n")
-  gene_ids_all <- rownames(se)
-  n_before_id_filter <- length(gene_ids_all)
-
-  ## Classify: keep HGNC-like symbols + ENSEMBL; drop GenBank, RefSeq, numeric, long strings
-  is_genbank  <- grepl("^(AK|BC|AJ|AF|AB|AL|CR|BX)[0-9]{5,}", gene_ids_all)
-  is_refseq   <- grepl("^(NM_|NR_|XM_|XR_)[0-9]", gene_ids_all)
-  is_numeric  <- grepl("^[0-9]+$", gene_ids_all)
-  is_ensg     <- grepl("^ENSG[0-9]", gene_ids_all)
-  is_too_long <- nchar(gene_ids_all) > 20 & !is_ensg
-  is_junk     <- is_genbank | is_refseq | is_numeric | is_too_long
-
-  n_junk <- sum(is_junk)
-  cat("[ID-FILTER] Identified", n_junk, "non-standard gene IDs of", n_before_id_filter, "total\n")
-  cat("[ID-FILTER]   GenBank accessions: ", sum(is_genbank), "\n")
-  cat("[ID-FILTER]   RefSeq IDs        : ", sum(is_refseq), "\n")
-  cat("[ID-FILTER]   Numeric-only      : ", sum(is_numeric), "\n")
-  cat("[ID-FILTER]   Overly long names : ", sum(is_too_long & !is_genbank & !is_refseq & !is_numeric), "\n")
-
-  ## Safety: ensure key genes survive
-  key_survival <- c("UCP1", "CLDN1", "ACTB", "GAPDH", "PPARG", "LEP")
-  for (kg in key_survival) {
-    if (kg %in% gene_ids_all[is_junk]) {
-      cat("[ID-FILTER] WARNING:", kg, "would be removed — overriding to keep it\n")
-      is_junk[gene_ids_all == kg] <- FALSE
-    }
-  }
-
-  if (n_junk > 0) {
-    se <- se[!is_junk, ]
-    cat("[ID-FILTER] Kept", nrow(se), "genes after removing", n_junk, "non-standard IDs\n")
-  } else {
-    cat("[ID-FILTER] All gene IDs look standard — no removal needed\n")
-  }
-
-  sanity$n_genes_after_id_filter <- nrow(se)
-
   ## ---- 4.2) Pre-filtering --------------------------------
+  ## Standard approach (Nature/Cell Metabolism convention):
+  ##   Keep genes with CPM >= 1 in at least the smallest group size.
+  ## This is purely count-driven — no gene-ID pattern matching needed.
+  ## Non-coding junk (GenBank accessions etc.) naturally drops out
+  ## because those features have zero/near-zero counts.
+  ##
+  ## References:
+  ##   - edgeR::filterByExpr() (Chen et al. 2016, F1000Research)
+  ##   - DESeq2 vignette: rowSums(counts >= 10) >= smallest_group
+  ##   - Robinson et al. 2010, Genome Biology (edgeR)
   cat("\n== 4.2  Pre-filtering low-count genes ==\n")
 
   counts_mat <- assay(se, "counts")
@@ -680,38 +647,55 @@ tryCatch({
   assay(se, "counts") <- counts_mat
 
   if (LOW_COUNT_FILTER) {
-    ## edgeR::filterByExpr() with CPM-calibrated min.count.
-    ## For deeply sequenced data (30-160M reads), min.count=10 yields
-    ## a CPM cutoff of ~0.1-0.3 which is too lenient.  We scale
-    ## min.count so it corresponds to CPM >= 1 at the median library size.
+    design_group <- se$tissue
+    min_group    <- min(table(design_group))
+    lib_sizes    <- colSums(counts_mat)
+    med_lib      <- median(lib_sizes)
+
+    cat("[FILTER] Smallest group size:", min_group, "samples\n")
+    cat("[FILTER] Median library size:", format(med_lib, big.mark = ","), "\n")
+
+    ## Step 1: fast pre-screen — remove genes with zero counts in ALL samples.
+    ##         This is instant and eliminates the bulk of ~217K features.
+    nonzero <- rowSums(counts_mat > 0) > 0
+    n_allzero <- sum(!nonzero)
+    cat("[FILTER] Removing", n_allzero, "genes with zero counts across all samples\n")
+    counts_mat_nz <- counts_mat[nonzero, , drop = FALSE]
+    cat("[FILTER] After zero removal:", nrow(counts_mat_nz), "genes remain\n")
+
+    ## Step 2: CPM >= 1 in at least min_group samples (standard threshold).
+    ##         This is the workhorse filter used in most Nature/Cell papers.
+    cpm_mat  <- t(t(counts_mat_nz) / lib_sizes * 1e6)
+    keep_cpm <- rowSums(cpm_mat >= 1) >= min_group
+    n_pass_cpm <- sum(keep_cpm)
+    cat("[FILTER] Genes with CPM >= 1 in >=", min_group, "samples:", n_pass_cpm, "\n")
+
+    ## Step 3 (optional): if edgeR available, refine with filterByExpr
+    ##         which also considers lib sizes and a min total count.
     if (requireNamespace("edgeR", quietly = TRUE)) {
-      design_group <- se$tissue
-      lib_sizes    <- colSums(counts_mat)
-      med_lib      <- median(lib_sizes)
-      min_count_cpm1 <- max(MIN_COUNTS_PER_GENE,
-                             ceiling(med_lib / 1e6))
-      cat("[FILTER] Median library size:", format(med_lib, big.mark = ","),
-          "-> min.count =", min_count_cpm1, "(CPM >= 1)\n")
-      cat("[FILTER] Using edgeR::filterByExpr()\n")
-      keep <- edgeR::filterByExpr(counts_mat, group = design_group,
-                                  min.count = min_count_cpm1)
+      min_count_cpm1 <- max(MIN_COUNTS_PER_GENE, ceiling(med_lib / 1e6))
+      keep_expr <- edgeR::filterByExpr(counts_mat_nz, group = design_group,
+                                       min.count = min_count_cpm1)
+      ## Use the intersection of both filters (most conservative)
+      keep <- keep_cpm & keep_expr
+      cat("[FILTER] edgeR::filterByExpr (min.count=", min_count_cpm1,
+          ") keeps:", sum(keep_expr), "\n", sep = "")
+      cat("[FILTER] Intersection of CPM + filterByExpr:", sum(keep), "\n")
     } else {
-      ## Fallback: simple threshold with dynamic group size
-      min_group <- if (is.null(MIN_SAMPLES_DETECTED)) {
-        min(table(se$tissue))
-      } else {
-        MIN_SAMPLES_DETECTED
-      }
-      cat("[FILTER] edgeR not available; requiring >=", MIN_COUNTS_PER_GENE,
-          "counts in >=", min_group, "samples\n")
-      keep <- rowSums(counts_mat >= MIN_COUNTS_PER_GENE, na.rm = TRUE) >= min_group
+      keep <- keep_cpm
+      cat("[FILTER] edgeR not available; using CPM filter only\n")
     }
-    se_filt <- se[keep, ]
-    cat("[FILTER] Kept", sum(keep), "of", nrow(se), "genes",
-        "(removed", sum(!keep), ")\n")
+
+    ## Apply filter back to full SE (must index into original row space)
+    keep_names <- rownames(counts_mat_nz)[keep]
+    se_filt <- se[keep_names, ]
+    cat("[FILTER] Final: kept", nrow(se_filt), "of", nrow(se), "genes",
+        "(removed", nrow(se) - nrow(se_filt), ")\n")
   } else {
     se_filt <- se
   }
+
+  sanity$n_genes_after_id_filter <- nrow(se)  # no separate ID filter; same as raw
 
   ## ---- Sanity block B: Post-filter diagnostics ----
   cat("\n--- SANITY BLOCK B: Post-filter diagnostics ---\n")
@@ -1446,8 +1430,7 @@ tryCatch({
       "Samples loaded",
       "Subjects detected",
       "Genes raw (before any filter)",
-      "Genes after ID filter",
-      "Genes after count filter",
+      "Genes after count filter (CPM>=1)",
       "Second-pass filter applied",
       "DESeq2 runtime (min)",
       "BAT-enriched genes (paper: 463)",
@@ -1462,7 +1445,6 @@ tryCatch({
       N_SAMPLES_EXPECTED,
       N_SUBJECTS,
       "~217000 (GEO file)",
-      "~20000-40000",
       "15000-25000",
       "FALSE (ideally)",
       "< 10",
@@ -1478,7 +1460,6 @@ tryCatch({
       sanity$n_samples,
       sanity$n_subjects,
       sanity$n_genes_raw,
-      ifelse(!is.null(sanity$n_genes_after_id_filter), sanity$n_genes_after_id_filter, "N/A"),
       sanity$n_genes_filtered,
       ifelse(!is.null(sanity$second_pass_filter), sanity$second_pass_filter, "N/A"),
       ifelse(!is.null(sanity$deseq_runtime_min), sanity$deseq_runtime_min, "N/A"),

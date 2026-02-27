@@ -325,7 +325,26 @@ tryCatch({
   if (file.exists(geo_cache)) {
     cat("[CACHE] Loading cached GEO data\n")
     se <- readRDS(geo_cache)
-  } else {
+    ## Validate cache: if it has >50K genes, it was built with transcript-level IDs
+    ## and must be rebuilt with gene-level aggregation.
+    if (nrow(se) > 50000) {
+      cat("[CACHE] STALE: cached SE has", nrow(se), "features (transcript-level).\n")
+      cat("[CACHE] Rebuilding with gene-level aggregation...\n")
+      file.remove(geo_cache)
+      rm(se)
+    } else {
+      ## Also check if key genes are present
+      has_ucp1 <- "UCP1" %in% rownames(se)
+      if (!has_ucp1) {
+        cat("[CACHE] STALE: cached SE missing UCP1 — likely transcript-level IDs.\n")
+        cat("[CACHE] Rebuilding with gene-level aggregation...\n")
+        file.remove(geo_cache)
+        rm(se)
+      }
+    }
+  }
+
+  if (!exists("se")) {
     ## Download the supplementary count matrix from GEO
     gse <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, getGPL = FALSE)
     gse <- gse[[1]]
@@ -363,15 +382,81 @@ tryCatch({
              ". If this is a gzipped file without .gz extension, recompress/rename or set LOCAL_COUNTS_PATH correctly.")
       }
 
-      ## First column is gene identifier; remaining columns should be counts
-      gene_col <- counts_raw[[1]]
-      counts_raw <- counts_raw[, -1, drop = FALSE]
+      ## ---- Smart gene-ID extraction ----
+      ## GEO count files vary in structure.  Common layouts:
+      ##   (a) col1 = ENSG/symbol, rest = counts
+      ##   (b) col1 = transcript accession, "Symbol" col has gene names, rest = counts
+      ## We prefer a "Symbol" column if it contains recognisable gene names.
+      cn <- colnames(counts_raw)
+
+      ## Look for a dedicated Symbol / GeneName column
+      symbol_col_idx <- grep("^(symbol|gene[._]?name|gene[._]?symbol|hgnc)$",
+                              cn, ignore.case = TRUE)
+
+      if (length(symbol_col_idx) > 0) {
+        ## Found a Symbol column — use it as the gene identifier
+        sym_idx <- symbol_col_idx[1]
+        gene_col <- as.character(counts_raw[[sym_idx]])
+        cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
+
+        ## Identify non-count annotation columns to drop
+        ## Keep only columns that look like sample data (numeric)
+        first_col <- counts_raw[[1]]
+        annotation_cols <- c(1, sym_idx)  # always drop col1 + symbol col
+
+        ## Also drop other annotation columns (GeneId, Description, etc.)
+        for (ci in seq_len(ncol(counts_raw))) {
+          if (ci %in% annotation_cols) next
+          col_vals <- as.character(counts_raw[[ci]])
+          ## If >50% of values fail numeric conversion, it's annotation
+          numeric_frac <- mean(!is.na(suppressWarnings(as.numeric(col_vals))), na.rm = TRUE)
+          if (numeric_frac < 0.5) {
+            annotation_cols <- c(annotation_cols, ci)
+          }
+        }
+
+        annotation_cols <- sort(unique(annotation_cols))
+        if (length(annotation_cols) > 0) {
+          dropped_names <- cn[annotation_cols]
+          cat("[INFO] Dropping annotation columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
+          counts_raw <- counts_raw[, -annotation_cols, drop = FALSE]
+        }
+      } else {
+        ## No Symbol column — fall back to col1 as gene identifier
+        gene_col <- as.character(counts_raw[[1]])
+        counts_raw <- counts_raw[, -1, drop = FALSE]
+        cat("[INFO] No 'Symbol' column found; using column 1 as gene identifier\n")
+      }
+
       counts_raw <- select_numeric_count_columns(as.data.frame(counts_raw))
 
-      ## Handle duplicate gene IDs by summing counts
+      ## ---- Gene-ID quality check ----
+      ## Warn if gene_col looks like transcript accessions, not gene symbols
+      sample_ids_check <- head(gene_col[gene_col != "" & !is.na(gene_col)], 50)
+      n_look_like_accessions <- sum(grepl("^(AK|BC|AJ|AF|AB|AL|ENST|NM_|NR_|XM_|XR_)[0-9]",
+                                           sample_ids_check))
+      if (n_look_like_accessions > length(sample_ids_check) * 0.3) {
+        cat("[WARNING] Gene IDs look like transcript accessions, not gene symbols!\n")
+        cat("          Sample IDs: ", paste(head(sample_ids_check, 5), collapse = ", "), "\n", sep = "")
+        cat("          This will prevent matching to gene names like UCP1/CLDN1.\n")
+        cat("          Check that the correct column was used as gene identifier.\n")
+      }
+
+      ## Remove rows with empty/NA gene symbols
+      valid_gene <- !is.na(gene_col) & nzchar(gene_col) & gene_col != "---" & gene_col != "NA"
+      if (sum(!valid_gene) > 0) {
+        cat("[INFO] Removing", sum(!valid_gene), "rows with empty/NA gene symbols\n")
+        gene_col   <- gene_col[valid_gene]
+        counts_raw <- counts_raw[valid_gene, , drop = FALSE]
+      }
+
+      ## Handle duplicate gene IDs by summing counts (transcript -> gene aggregation)
       if (anyDuplicated(gene_col)) {
         n_dup <- sum(duplicated(gene_col))
-        cat("[INFO] Found", n_dup, "duplicate gene names — aggregating by sum\n")
+        n_unique <- length(unique(gene_col))
+        cat("[INFO] Found", n_dup, "duplicate gene names (",
+            length(gene_col), "transcripts -> ", n_unique, "unique genes)\n")
+        cat("[INFO] Aggregating to gene level by summing transcript counts\n")
         counts_raw$..gene.. <- gene_col
         counts_raw <- aggregate(. ~ ..gene.., data = counts_raw, FUN = sum)
         gene_col   <- counts_raw$..gene..
@@ -394,24 +479,39 @@ tryCatch({
         cat("[A1] WARNING: Some samples have very low library sizes (<100K).\n")
         cat("     Low samples:", paste(names(which(lib_sizes_raw < 1e5)), collapse = ", "), "\n")
       }
+      ## Standard RNA-seq: 10M-200M reads per sample -> lib sizes ~10M-200M.
+      ## If lib sizes are >1 billion, data may be transcript-level or pre-scaled.
+      if (median(lib_sizes_raw) > 1e9) {
+        cat("[A1] WARNING: Median library size is ", format(median(lib_sizes_raw), big.mark = ","),
+            " — this is FAR above typical RNA-seq (10M-200M).\n", sep = "")
+        cat("     Possible causes:\n")
+        cat("     - Data is at transcript level (needs gene-level aggregation)\n")
+        cat("     - Genomatix weighted counts (not raw read counts)\n")
+        cat("     - Pre-scaled or multiplied values\n")
+        cat("     DESeq2 may still work, but interpret size factors carefully.\n")
+      } else if (median(lib_sizes_raw) >= 1e6 && median(lib_sizes_raw) <= 5e8) {
+        cat("[A1] OK — library sizes in typical RNA-seq range\n")
+      }
 
       ## A2. Gene ID classification
       gene_ids <- rownames(counts_raw)
       n_total_genes <- length(gene_ids)
       n_hgnc_like   <- sum(grepl("^[A-Z][A-Z0-9-]*$", gene_ids) &
                             nchar(gene_ids) <= 15 &
-                            !grepl("^(AK|BC|AJ|AF|NM_|NR_|XM_|XR_)", gene_ids))
+                            !grepl("^(AK|BC|AJ|AF|NM_|NR_|XM_|XR_|ENST|ENSG)", gene_ids))
       n_genbank     <- sum(grepl("^(AK|BC|AJ|AF|AB|AL|CR|BX)[0-9]{5,}", gene_ids))
       n_refseq      <- sum(grepl("^(NM_|NR_|XM_|XR_)", gene_ids))
+      n_enst        <- sum(grepl("^ENST", gene_ids))
       n_ensg        <- sum(grepl("^ENSG", gene_ids))
       n_numeric     <- sum(grepl("^[0-9]+$", gene_ids))
-      n_other       <- n_total_genes - n_hgnc_like - n_genbank - n_refseq - n_ensg - n_numeric
+      n_other       <- n_total_genes - n_hgnc_like - n_genbank - n_refseq - n_enst - n_ensg - n_numeric
 
       cat("[A2] Gene ID classification (", n_total_genes, " total):\n", sep = "")
       cat("     HGNC-like symbols : ", n_hgnc_like, " (", round(100 * n_hgnc_like / n_total_genes, 1), "%)\n", sep = "")
       cat("     GenBank accessions: ", n_genbank, " (", round(100 * n_genbank / n_total_genes, 1), "%)\n", sep = "")
       cat("     RefSeq IDs        : ", n_refseq, " (", round(100 * n_refseq / n_total_genes, 1), "%)\n", sep = "")
-      cat("     ENSEMBL IDs       : ", n_ensg, " (", round(100 * n_ensg / n_total_genes, 1), "%)\n", sep = "")
+      cat("     ENSEMBL transcr.  : ", n_enst, " (", round(100 * n_enst / n_total_genes, 1), "%)\n", sep = "")
+      cat("     ENSEMBL genes     : ", n_ensg, " (", round(100 * n_ensg / n_total_genes, 1), "%)\n", sep = "")
       cat("     Numeric only      : ", n_numeric, " (", round(100 * n_numeric / n_total_genes, 1), "%)\n", sep = "")
       cat("     Other/ambiguous   : ", n_other, " (", round(100 * n_other / n_total_genes, 1), "%)\n", sep = "")
       cat("     Sample gene IDs (first 10):", paste(head(gene_ids, 10), collapse = ", "), "\n")
@@ -432,7 +532,8 @@ tryCatch({
       ## A4. Flag non-standard IDs for potential removal
       is_standard <- grepl("^[A-Z][A-Z0-9-]*$", gene_ids) &
                      nchar(gene_ids) <= 15 &
-                     !grepl("^(AK|BC|AJ|AF|AB|AL|CR|BX)[0-9]{5,}", gene_ids)
+                     !grepl("^(AK|BC|AJ|AF|AB|AL|CR|BX)[0-9]{5,}", gene_ids) &
+                     !grepl("^(ENST|ENSG)[0-9]", gene_ids)
       n_standard <- sum(is_standard)
       cat("[A4] Standard gene symbols (potential HGNC): ", n_standard, " of ", n_total_genes, "\n", sep = "")
       if (n_standard > 0 && n_standard < n_total_genes) {

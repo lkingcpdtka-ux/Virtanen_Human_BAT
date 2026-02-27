@@ -588,6 +588,73 @@ tryCatch({
   subj_tab <- sort(table(se$subject), decreasing = TRUE)
   print(head(subj_tab, 10))
 
+  ## ---- Sanity: are these raw counts or pre-normalised? ----
+  ## Raw counts are integers >= 0 with most values in hundreds-thousands range.
+  ## RPKM/FPKM/TPM are floats, typically 0-100 with many decimals.
+  ## If the data looks pre-normalised, DESeq2 will give wrong results.
+  cat("\n--- SANITY: Raw count validation ---\n")
+  count_sample <- assay(se, "counts")
+  count_vals   <- as.numeric(count_sample[sample(nrow(count_sample), min(5000, nrow(count_sample))),
+                                           sample(ncol(count_sample), min(5, ncol(count_sample)))])
+  count_vals   <- count_vals[!is.na(count_vals)]
+
+  frac_integer <- mean(count_vals == round(count_vals), na.rm = TRUE)
+  frac_zero    <- mean(count_vals == 0, na.rm = TRUE)
+  count_max    <- max(count_vals, na.rm = TRUE)
+  count_median <- median(count_vals, na.rm = TRUE)
+
+  cat("[RAW-CHECK] Fraction integer-valued: ", round(frac_integer, 3), "\n", sep = "")
+  cat("[RAW-CHECK] Fraction zero          : ", round(frac_zero, 3), "\n", sep = "")
+  cat("[RAW-CHECK] Median value           : ", round(count_median, 2), "\n", sep = "")
+  cat("[RAW-CHECK] Max value              : ", format(count_max, big.mark = ","), "\n", sep = "")
+
+  if (frac_integer < 0.9) {
+    cat("[RAW-CHECK] WARNING: Data appears to be NORMALISED (RPKM/FPKM/TPM),\n")
+    cat("            not raw counts. DESeq2 requires raw integer counts.\n")
+    cat("            Fraction integer:", round(frac_integer, 3), "\n")
+    sanity$data_type_warning <- "LIKELY_NORMALIZED"
+  } else if (count_max < 500 && count_median < 10) {
+    cat("[RAW-CHECK] WARNING: Values look unusually low for raw counts.\n")
+    cat("            Possible CPM or log-transformed data.\n")
+    sanity$data_type_warning <- "UNUSUALLY_LOW"
+  } else {
+    cat("[RAW-CHECK] OK — data looks like raw integer counts\n")
+    sanity$data_type_warning <- "NONE"
+  }
+
+  ## ---- Sanity: paired design validation ----
+  ## For a paired design (~ subject + tissue), every subject must have
+  ## both BAT and WAT.  Unpaired subjects break the model.
+  cat("\n--- SANITY: Paired design validation ---\n")
+  subj_tissue <- table(se$subject, se$tissue)
+  has_both    <- rowSums(subj_tissue > 0) == 2
+  unpaired    <- names(has_both)[!has_both]
+
+  if (length(unpaired) > 0) {
+    cat("[PAIRED] WARNING: ", length(unpaired), " subject(s) lack one tissue:\n", sep = "")
+    for (u in unpaired) {
+      present <- colnames(subj_tissue)[subj_tissue[u, ] > 0]
+      cat("         ", u, " — only has: ", paste(present, collapse = ", "), "\n", sep = "")
+    }
+    cat("[PAIRED] Removing unpaired subjects to avoid DESeq2 model errors\n")
+    keep_paired <- !(se$subject %in% unpaired)
+    se <- se[, keep_paired]
+    se$subject <- droplevels(se$subject)
+    cat("[PAIRED] Remaining: ", ncol(se), " samples from ",
+        nlevels(se$subject), " complete pairs\n", sep = "")
+  } else {
+    cat("[PAIRED] OK — all ", nlevels(se$subject),
+        " subjects have both ", CONDITION_REF, " and ", CONDITION_TEST, "\n", sep = "")
+  }
+
+  ## Check for duplicate tissue per subject (would also break paired model)
+  max_per_cell <- max(subj_tissue[has_both, ])
+  if (max_per_cell > 1) {
+    cat("[PAIRED] WARNING: Some subject-tissue combos have >1 sample.\n")
+    cat("         Max samples per cell:", max_per_cell, "\n")
+    cat("         DESeq2 paired design expects exactly 1 per cell.\n")
+  }
+
   ## Exclude subjects if specified (to match paper's 14-subject cohort)
   if (exists("SUBJECTS_TO_EXCLUDE") && !is.null(SUBJECTS_TO_EXCLUDE) &&
       length(SUBJECTS_TO_EXCLUDE) > 0) {
@@ -833,6 +900,81 @@ tryCatch({
       "(", round(as.numeric(deseq_elapsed), 1), "min )\n")
   sanity$deseq_runtime_min <- round(as.numeric(deseq_elapsed), 2)
 
+  ## ---- Sanity block D: Post-DESeq2 model diagnostics ----
+  cat("\n--- SANITY BLOCK D: DESeq2 model diagnostics ---\n")
+
+  ## D1. Size factors — should be ~0.5-2.0 for most samples.
+  ##     Extreme values indicate library-size or composition problems.
+  sf <- sizeFactors(dds)
+  cat("[D1] Size factors:\n")
+  cat("     min =", round(min(sf), 3), " median =", round(median(sf), 3),
+      " max =", round(max(sf), 3), "\n")
+  sf_outliers <- names(sf)[sf < 0.1 | sf > 10]
+  if (length(sf_outliers) > 0) {
+    cat("[D1] WARNING: Extreme size factors in:", paste(sf_outliers, collapse = ", "), "\n")
+    cat("     This may indicate failed library prep or contamination.\n")
+  } else {
+    cat("[D1] OK — all size factors within normal range (0.1-10)\n")
+  }
+  sanity$size_factor_range <- paste0(round(min(sf), 3), "-", round(max(sf), 3))
+
+  ## D2. Dispersion estimates — check for unusual patterns.
+  ##     Median dispersion for human RNA-seq is typically 0.01-0.3.
+  dispersions <- mcols(dds)$dispGeneEst
+  dispersions <- dispersions[!is.na(dispersions)]
+  if (length(dispersions) > 0) {
+    cat("[D2] Gene-level dispersions:\n")
+    cat("     median =", round(median(dispersions), 4),
+        " mean =", round(mean(dispersions), 4), "\n")
+    cat("     Quantiles: 5%=", round(quantile(dispersions, 0.05), 4),
+        " 25%=", round(quantile(dispersions, 0.25), 4),
+        " 75%=", round(quantile(dispersions, 0.75), 4),
+        " 95%=", round(quantile(dispersions, 0.95), 4), "\n")
+    if (median(dispersions) > 1) {
+      cat("[D2] WARNING: High median dispersion suggests noisy data or poor model fit.\n")
+    } else {
+      cat("[D2] OK — dispersion range typical for human tissue RNA-seq\n")
+    }
+  }
+
+  ## D3. Convergence — check for genes where DESeq2 maxed out iterations.
+  n_not_converged <- sum(mcols(dds)$betaConv == FALSE, na.rm = TRUE)
+  cat("[D3] Genes that did not converge:", n_not_converged, "of", nrow(dds), "\n")
+  if (n_not_converged > nrow(dds) * 0.05) {
+    cat("[D3] WARNING: >5% non-convergence. Model may be mis-specified.\n")
+  } else {
+    cat("[D3] OK — convergence rate normal\n")
+  }
+
+  ## D4. Cook's distance — flag outlier samples that dominate results.
+  ##     High Cook's for many genes in one sample = probable outlier.
+  cooks_mat <- assays(dds)[["cooks"]]
+  if (!is.null(cooks_mat)) {
+    cooks_per_sample <- apply(as.matrix(cooks_mat), 2, median, na.rm = TRUE)
+    names(cooks_per_sample) <- colnames(dds)
+    cooks_threshold <- qf(0.99, ncol(model.matrix(design(dds), colData(dds))),
+                          ncol(dds) - ncol(model.matrix(design(dds), colData(dds))))
+    cat("[D4] Cook's distance (median per sample):\n")
+    cooks_df <- data.frame(
+      sample = names(cooks_per_sample),
+      tissue = as.character(dds$tissue),
+      median_cooks = round(cooks_per_sample, 4),
+      stringsAsFactors = FALSE
+    )
+    cooks_df <- cooks_df[order(-cooks_df$median_cooks), ]
+    print(head(cooks_df, 6), row.names = FALSE)
+    high_cooks <- cooks_df$sample[cooks_df$median_cooks > 1]
+    if (length(high_cooks) > 0) {
+      cat("[D4] WARNING: Samples with high Cook's distance: ",
+          paste(high_cooks, collapse = ", "), "\n", sep = "")
+      cat("     Consider removing these outliers and re-running.\n")
+    } else {
+      cat("[D4] OK — no sample-level outliers by Cook's distance\n")
+    }
+  }
+
+  cat("--- END SANITY BLOCK D ---\n\n")
+
   ## Extract results
   res <- results(dds,
                   contrast = c("tissue", CONDITION_TEST, CONDITION_REF),
@@ -848,6 +990,62 @@ tryCatch({
   cat("     Up in WAT (padj <", PADJ_CUTOFF, ", LFC <=", -LFC_CUTOFF, "):",
       sum(res_df$padj < PADJ_CUTOFF & res_df$log2FoldChange <= -LFC_CUTOFF,
           na.rm = TRUE), "\n")
+
+  ## ---- Sanity block E: P-value distribution ----
+  ## A healthy DE analysis has a uniform distribution of p-values
+  ## (null genes) with a spike near 0 (true DE genes).
+  ## Anti-conservative (U-shape) = batch effects or model problems.
+  ## All p ~ 1 = no signal or wrong comparison.
+  cat("\n--- SANITY BLOCK E: P-value distribution ---\n")
+  pvals <- res_df$pvalue[!is.na(res_df$pvalue)]
+  n_total_pvals <- length(pvals)
+  n_na_pvals    <- sum(is.na(res_df$pvalue))
+
+  cat("[E1] Total genes with p-values:", n_total_pvals,
+      " (NA:", n_na_pvals, ")\n")
+
+  ## Bin p-values into deciles
+  pval_bins <- cut(pvals, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
+  pval_tab  <- table(pval_bins)
+  cat("[E2] P-value histogram (deciles):\n")
+  for (b in names(pval_tab)) {
+    bar_len <- round(pval_tab[b] / n_total_pvals * 50)
+    cat(sprintf("     %-12s %5d (%4.1f%%) %s\n",
+                b, pval_tab[b],
+                100 * pval_tab[b] / n_total_pvals,
+                paste(rep("#", bar_len), collapse = "")))
+  }
+
+  ## Diagnostic: expect bin[0,0.1] to be the largest (DE signal).
+  ## If bin[0.9,1] is larger, something is wrong.
+  first_bin <- pval_tab[1]
+  last_bin  <- pval_tab[length(pval_tab)]
+  mid_bins_mean <- mean(pval_tab[2:(length(pval_tab) - 1)])
+
+  if (first_bin < mid_bins_mean) {
+    cat("[E3] WARNING: No enrichment of small p-values. Possible issues:\n")
+    cat("     - Wrong contrast or reference level\n")
+    cat("     - Pre-normalised data passed to DESeq2\n")
+    cat("     - Severe batch effects dominating the signal\n")
+    sanity$pval_distribution <- "NO_SIGNAL"
+  } else if (last_bin > 2 * mid_bins_mean) {
+    cat("[E3] WARNING: Anti-conservative p-value distribution (spike near 1).\n")
+    cat("     Possible batch effects, misspecified model, or violated assumptions.\n")
+    sanity$pval_distribution <- "ANTI_CONSERVATIVE"
+  } else {
+    cat("[E3] OK — p-value distribution looks healthy (spike near 0, flat elsewhere)\n")
+    sanity$pval_distribution <- "HEALTHY"
+  }
+
+  ## E4. NA/filtered gene accounting
+  n_padj_na      <- sum(is.na(res_df$padj))
+  n_outlier_na   <- sum(is.na(res_df$pvalue) & !is.na(res_df$baseMean) & res_df$baseMean > 0)
+  n_low_count_na <- sum(is.na(res_df$pvalue) & (is.na(res_df$baseMean) | res_df$baseMean == 0))
+  cat("[E4] padj NA (independent filtering):", n_padj_na, "of", nrow(res_df), "\n")
+  cat("     pvalue NA (outlier/low count)   :", sum(is.na(res_df$pvalue)), "\n")
+  cat("     Effectively tested              :", n_total_pvals, "\n")
+
+  cat("--- END SANITY BLOCK E ---\n\n")
 
   sanity$n_up_bat <- sum(res_df$padj < PADJ_CUTOFF &
                           res_df$log2FoldChange >= LFC_CUTOFF, na.rm = TRUE)
@@ -1058,6 +1256,91 @@ tryCatch({
 
   vst_mat <- assay(vsd)
   cat("[OK] VST matrix:", nrow(vst_mat), "genes x", ncol(vst_mat), "samples\n")
+
+  ## ---- Sanity block F: Sample-level QC (on VST data) ----
+  cat("\n--- SANITY BLOCK F: Sample-level QC ---\n")
+
+  ## F1. Inter-sample Spearman correlation — should be high (>0.8)
+  ##     within tissue, lower between tissues.
+  if (ncol(vst_mat) <= 100) {  # skip for very large designs
+    cor_mat <- cor(vst_mat, method = "spearman")
+    diag(cor_mat) <- NA  # remove self-correlations
+    tissue_vec <- as.character(colData(dds)$tissue)
+
+    ## Within-group correlations
+    for (tis in c(CONDITION_REF, CONDITION_TEST)) {
+      idx <- which(tissue_vec == tis)
+      if (length(idx) >= 2) {
+        within_cors <- cor_mat[idx, idx][upper.tri(cor_mat[idx, idx])]
+        cat("[F1] ", tis, " within-group Spearman: min=", round(min(within_cors, na.rm = TRUE), 3),
+            " median=", round(median(within_cors, na.rm = TRUE), 3),
+            " max=", round(max(within_cors, na.rm = TRUE), 3), "\n", sep = "")
+        if (min(within_cors, na.rm = TRUE) < 0.8) {
+          low_pairs <- which(cor_mat[idx, idx] < 0.8 & upper.tri(cor_mat[idx, idx]), arr.ind = TRUE)
+          cat("[F1] WARNING: Low within-group correlation in ", tis,
+              " — possible outlier sample(s)\n", sep = "")
+        }
+      }
+    }
+
+    ## Between-group correlations
+    bat_idx <- which(tissue_vec == CONDITION_TEST)
+    wat_idx <- which(tissue_vec == CONDITION_REF)
+    if (length(bat_idx) > 0 && length(wat_idx) > 0) {
+      between_cors <- as.vector(cor_mat[bat_idx, wat_idx])
+      between_cors <- between_cors[!is.na(between_cors)]
+      cat("[F1] Between-group Spearman: min=", round(min(between_cors), 3),
+          " median=", round(median(between_cors), 3), "\n", sep = "")
+    }
+  }
+
+  ## F2. PCA variance — PC1 should capture tissue effect.
+  ##     If PC1 variance is <10%, the tissue signal may be weak.
+  pca_obj <- prcomp(t(vst_mat), center = TRUE, scale. = FALSE)
+  pct_var <- round(100 * (pca_obj$sdev^2 / sum(pca_obj$sdev^2)), 1)
+  cat("[F2] PCA variance explained: PC1=", pct_var[1], "% PC2=", pct_var[2],
+      "% PC3=", pct_var[3], "%\n", sep = "")
+
+  ## Check if PC1 separates tissues
+  pc1_by_tissue <- split(pca_obj$x[, 1], colData(dds)$tissue)
+  if (length(pc1_by_tissue) == 2) {
+    pc1_ttest <- tryCatch(
+      t.test(pc1_by_tissue[[1]], pc1_by_tissue[[2]]),
+      error = function(e) NULL
+    )
+    if (!is.null(pc1_ttest)) {
+      cat("[F2] PC1 separates tissues: t-test p =", signif(pc1_ttest$p.value, 3), "\n")
+      if (pc1_ttest$p.value > 0.05) {
+        cat("[F2] WARNING: PC1 does NOT significantly separate tissues.\n")
+        cat("     Tissue effect may be weak or confounded by batch/subject effects.\n")
+      } else {
+        cat("[F2] OK — PC1 clearly separates BAT from WAT\n")
+      }
+    }
+  }
+  sanity$pca_pc1_var <- pct_var[1]
+
+  ## F3. Sample distance outlier detection
+  ##     Flag any sample >3 median absolute deviations from group centroid.
+  for (tis in c(CONDITION_REF, CONDITION_TEST)) {
+    idx <- which(tissue_vec == tis)
+    if (length(idx) >= 3) {
+      group_mat <- t(vst_mat[, idx])
+      centroid  <- colMeans(group_mat)
+      dists     <- sqrt(rowSums((group_mat - rep(centroid, each = nrow(group_mat)))^2))
+      med_dist  <- median(dists)
+      mad_dist  <- mad(dists)
+      outliers  <- names(dists)[dists > med_dist + 3 * mad_dist]
+      if (length(outliers) > 0) {
+        cat("[F3] ", tis, " outlier(s) by Euclidean distance: ",
+            paste(outliers, collapse = ", "), "\n", sep = "")
+      } else {
+        cat("[F3] ", tis, ": no distance outliers detected\n", sep = "")
+      }
+    }
+  }
+
+  cat("--- END SANITY BLOCK F ---\n\n")
 
   ## ---- 4.8) Save full DE table ---------------------------
   cat("\n== 4.8  Saving results tables ==\n")

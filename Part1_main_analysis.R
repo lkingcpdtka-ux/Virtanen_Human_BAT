@@ -556,14 +556,21 @@ tryCatch({
   assay(se, "counts") <- counts_mat
 
   if (LOW_COUNT_FILTER) {
-    ## Use edgeR::filterByExpr() — the bioinformatics gold standard.
-    ## It computes a CPM threshold calibrated to library size and group
-    ## structure, giving a principled gene set (~15-25 K for human RNA-seq).
+    ## edgeR::filterByExpr() with CPM-calibrated min.count.
+    ## For deeply sequenced data (30-160M reads), min.count=10 yields
+    ## a CPM cutoff of ~0.1-0.3 which is too lenient.  We scale
+    ## min.count so it corresponds to CPM >= 1 at the median library size.
     if (requireNamespace("edgeR", quietly = TRUE)) {
-      cat("[FILTER] Using edgeR::filterByExpr() (recommended)\n")
       design_group <- se$tissue
+      lib_sizes    <- colSums(counts_mat)
+      med_lib      <- median(lib_sizes)
+      min_count_cpm1 <- max(MIN_COUNTS_PER_GENE,
+                             ceiling(med_lib / 1e6))
+      cat("[FILTER] Median library size:", format(med_lib, big.mark = ","),
+          "-> min.count =", min_count_cpm1, "(CPM >= 1)\n")
+      cat("[FILTER] Using edgeR::filterByExpr()\n")
       keep <- edgeR::filterByExpr(counts_mat, group = design_group,
-                                  min.count = MIN_COUNTS_PER_GENE)
+                                  min.count = min_count_cpm1)
     } else {
       ## Fallback: simple threshold with dynamic group size
       min_group <- if (is.null(MIN_SAMPLES_DETECTED)) {

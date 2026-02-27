@@ -320,27 +320,55 @@ tryCatch({
   ## ---- 4.1) Download / load GEO data ---------------------
   cat("== 4.1  Fetching GEO data:", GEO_ACCESSION, "==\n")
 
+  ## Clean slate — prevent stale objects from a previous run in the same
+  ## R session from silently skipping the rebuild.
+  if (exists("se", inherits = FALSE))  rm(se)
+  if (exists("dds", inherits = FALSE)) rm(dds)
+  if (exists("vsd", inherits = FALSE)) rm(vsd)
+
   geo_cache <- file.path(cache_dir, paste0(GEO_ACCESSION, "_SE.rds"))
+
+  ## Also check for stale SE caches in ALL previous savepoint directories
+  ## (when re-running after a parsing fix, old caches cause silent failures)
+  savepoints_root <- file.path(getwd(), "savepoints")
+  if (dir.exists(savepoints_root)) {
+    all_se_caches <- list.files(savepoints_root,
+                                 pattern = paste0(GEO_ACCESSION, "_SE\\.rds$"),
+                                 recursive = TRUE, full.names = TRUE)
+    for (old_cache in all_se_caches) {
+      old_se <- tryCatch(readRDS(old_cache), error = function(e) NULL)
+      if (!is.null(old_se) && (nrow(old_se) > 50000 || !("UCP1" %in% rownames(old_se)))) {
+        cat("[CACHE] Purging stale SE cache:", old_cache, "\n")
+        file.remove(old_cache)
+        ## Also remove associated DESeq2 and VST caches in the same directory
+        old_cache_dir <- dirname(old_cache)
+        stale_dds <- list.files(old_cache_dir, pattern = "^dds_.*\\.rds$", full.names = TRUE)
+        stale_vst <- list.files(old_cache_dir, pattern = "^vst_.*\\.rds$", full.names = TRUE)
+        for (f in c(stale_dds, stale_vst)) {
+          cat("[CACHE] Purging stale:", basename(f), "\n")
+          file.remove(f)
+        }
+      }
+      if (!is.null(old_se)) rm(old_se)
+    }
+  }
 
   if (file.exists(geo_cache)) {
     cat("[CACHE] Loading cached GEO data\n")
     se <- readRDS(geo_cache)
-    ## Validate cache: if it has >50K genes, it was built with transcript-level IDs
-    ## and must be rebuilt with gene-level aggregation.
-    if (nrow(se) > 50000) {
-      cat("[CACHE] STALE: cached SE has", nrow(se), "features (transcript-level).\n")
-      cat("[CACHE] Rebuilding with gene-level aggregation...\n")
+    ## Validate: must have recognisable gene symbols and reasonable dimensions
+    if (nrow(se) > 50000 || !("UCP1" %in% rownames(se))) {
+      cat("[CACHE] STALE: cached SE has", nrow(se), "features",
+          "(UCP1 present:", "UCP1" %in% rownames(se), ")\n")
+      cat("[CACHE] Removing stale cache and rebuilding...\n")
       file.remove(geo_cache)
+      ## Also clear downstream caches
+      for (f in list.files(cache_dir, pattern = "^(dds_|vst_).*\\.rds$", full.names = TRUE)) {
+        file.remove(f)
+      }
       rm(se)
     } else {
-      ## Also check if key genes are present
-      has_ucp1 <- "UCP1" %in% rownames(se)
-      if (!has_ucp1) {
-        cat("[CACHE] STALE: cached SE missing UCP1 — likely transcript-level IDs.\n")
-        cat("[CACHE] Rebuilding with gene-level aggregation...\n")
-        file.remove(geo_cache)
-        rm(se)
-      }
+      cat("[CACHE] Valid: ", nrow(se), " genes, UCP1 present\n", sep = "")
     }
   }
 

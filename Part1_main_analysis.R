@@ -380,6 +380,87 @@ tryCatch({
 
       rownames(counts_raw) <- gene_col
       cat("[SANITY] Count matrix dimensions after cleanup:", nrow(counts_raw), "x", ncol(counts_raw), "\n")
+
+      ## ---- Sanity block A: Characterise raw count matrix ----
+      cat("\n--- SANITY BLOCK A: Raw count matrix diagnostics ---\n")
+
+      ## A1. Library sizes
+      lib_sizes_raw <- colSums(counts_raw, na.rm = TRUE)
+      cat("[A1] Library sizes (total counts per sample):\n")
+      cat("     min =", format(min(lib_sizes_raw), big.mark = ","),
+          " median =", format(median(lib_sizes_raw), big.mark = ","),
+          " max =", format(max(lib_sizes_raw), big.mark = ","), "\n")
+      if (any(lib_sizes_raw < 1e5)) {
+        cat("[A1] WARNING: Some samples have very low library sizes (<100K).\n")
+        cat("     Low samples:", paste(names(which(lib_sizes_raw < 1e5)), collapse = ", "), "\n")
+      }
+
+      ## A2. Gene ID classification
+      gene_ids <- rownames(counts_raw)
+      n_total_genes <- length(gene_ids)
+      n_hgnc_like   <- sum(grepl("^[A-Z][A-Z0-9-]*$", gene_ids) &
+                            nchar(gene_ids) <= 15 &
+                            !grepl("^(AK|BC|AJ|AF|NM_|NR_|XM_|XR_)", gene_ids))
+      n_genbank     <- sum(grepl("^(AK|BC|AJ|AF|AB|AL|CR|BX)[0-9]{5,}", gene_ids))
+      n_refseq      <- sum(grepl("^(NM_|NR_|XM_|XR_)", gene_ids))
+      n_ensg        <- sum(grepl("^ENSG", gene_ids))
+      n_numeric     <- sum(grepl("^[0-9]+$", gene_ids))
+      n_other       <- n_total_genes - n_hgnc_like - n_genbank - n_refseq - n_ensg - n_numeric
+
+      cat("[A2] Gene ID classification (", n_total_genes, " total):\n", sep = "")
+      cat("     HGNC-like symbols : ", n_hgnc_like, " (", round(100 * n_hgnc_like / n_total_genes, 1), "%)\n", sep = "")
+      cat("     GenBank accessions: ", n_genbank, " (", round(100 * n_genbank / n_total_genes, 1), "%)\n", sep = "")
+      cat("     RefSeq IDs        : ", n_refseq, " (", round(100 * n_refseq / n_total_genes, 1), "%)\n", sep = "")
+      cat("     ENSEMBL IDs       : ", n_ensg, " (", round(100 * n_ensg / n_total_genes, 1), "%)\n", sep = "")
+      cat("     Numeric only      : ", n_numeric, " (", round(100 * n_numeric / n_total_genes, 1), "%)\n", sep = "")
+      cat("     Other/ambiguous   : ", n_other, " (", round(100 * n_other / n_total_genes, 1), "%)\n", sep = "")
+      cat("     Sample gene IDs (first 10):", paste(head(gene_ids, 10), collapse = ", "), "\n")
+      cat("     Sample gene IDs (random 10):", paste(sample(gene_ids, min(10, length(gene_ids))), collapse = ", "), "\n")
+
+      ## A3. Zero-count genes
+      row_sums <- rowSums(counts_raw, na.rm = TRUE)
+      n_zero   <- sum(row_sums == 0)
+      n_tiny   <- sum(row_sums > 0 & row_sums < 10)
+      cat("[A3] Count distribution by gene:\n")
+      cat("     Zero across all samples: ", n_zero, " (", round(100 * n_zero / n_total_genes, 1), "%)\n", sep = "")
+      cat("     Total counts 1-9       : ", n_tiny, " (", round(100 * n_tiny / n_total_genes, 1), "%)\n", sep = "")
+      cat("     Total counts >= 10     : ", sum(row_sums >= 10), "\n", sep = "")
+      cat("     Row-sum quantiles: ", paste(names(quantile(row_sums, c(0, 0.25, 0.5, 0.75, 0.9, 0.99, 1))),
+          "=", format(quantile(row_sums, c(0, 0.25, 0.5, 0.75, 0.9, 0.99, 1)), big.mark = ","),
+          collapse = "  "), "\n")
+
+      ## A4. Flag non-standard IDs for potential removal
+      is_standard <- grepl("^[A-Z][A-Z0-9-]*$", gene_ids) &
+                     nchar(gene_ids) <= 15 &
+                     !grepl("^(AK|BC|AJ|AF|AB|AL|CR|BX)[0-9]{5,}", gene_ids)
+      n_standard <- sum(is_standard)
+      cat("[A4] Standard gene symbols (potential HGNC): ", n_standard, " of ", n_total_genes, "\n", sep = "")
+      if (n_standard > 0 && n_standard < n_total_genes) {
+        ## Show what non-standard IDs contribute in terms of counts
+        nonstandard_total <- sum(row_sums[!is_standard])
+        standard_total    <- sum(row_sums[is_standard])
+        cat("     Standard symbols carry ",
+            round(100 * standard_total / (standard_total + nonstandard_total), 1),
+            "% of all counts\n", sep = "")
+        cat("     Non-standard IDs carry ",
+            round(100 * nonstandard_total / (standard_total + nonstandard_total), 1),
+            "% of all counts\n", sep = "")
+      }
+
+      ## A5. Key gene presence check (before any filtering)
+      key_genes <- c("UCP1", "CLDN1", "ACTB", "GAPDH", "PPARG", "LEP")
+      for (kg in key_genes) {
+        idx <- which(gene_ids == kg)
+        if (length(idx) > 0) {
+          cat("[A5] ", kg, " present — row sum = ",
+              format(row_sums[idx[1]], big.mark = ","),
+              ", mean = ", round(mean(as.numeric(counts_raw[idx[1], ])), 1), "\n", sep = "")
+        } else {
+          cat("[A5] ", kg, " NOT FOUND in gene IDs\n", sep = "")
+        }
+      }
+      cat("--- END SANITY BLOCK A ---\n\n")
+
     } else {
       ## Fallback: use exprs() from the GEO Series Matrix
       cat("[INFO] No count file found; using Series Matrix expression data\n")
@@ -522,6 +603,49 @@ tryCatch({
   sanity$n_subjects    <- nlevels(se$subject)
   sanity$tissues       <- levels(se$tissue)
 
+  ## ---- 4.1b) Gene-ID pre-filter --------------------------
+  ## The GEO count file contains ~217K features including GenBank
+  ## accessions (AK/BC/...), RefSeq IDs, and other non-standard
+  ## identifiers.  The paper used Genomatix which would have mapped
+  ## only to coding genes.  Strip non-standard IDs to approximate
+  ## what the paper actually analysed.
+  cat("\n== 4.1b  Gene-ID pre-filter ==\n")
+  gene_ids_all <- rownames(se)
+  n_before_id_filter <- length(gene_ids_all)
+
+  ## Classify: keep HGNC-like symbols + ENSEMBL; drop GenBank, RefSeq, numeric, long strings
+  is_genbank  <- grepl("^(AK|BC|AJ|AF|AB|AL|CR|BX)[0-9]{5,}", gene_ids_all)
+  is_refseq   <- grepl("^(NM_|NR_|XM_|XR_)[0-9]", gene_ids_all)
+  is_numeric  <- grepl("^[0-9]+$", gene_ids_all)
+  is_ensg     <- grepl("^ENSG[0-9]", gene_ids_all)
+  is_too_long <- nchar(gene_ids_all) > 20 & !is_ensg
+  is_junk     <- is_genbank | is_refseq | is_numeric | is_too_long
+
+  n_junk <- sum(is_junk)
+  cat("[ID-FILTER] Identified", n_junk, "non-standard gene IDs of", n_before_id_filter, "total\n")
+  cat("[ID-FILTER]   GenBank accessions: ", sum(is_genbank), "\n")
+  cat("[ID-FILTER]   RefSeq IDs        : ", sum(is_refseq), "\n")
+  cat("[ID-FILTER]   Numeric-only      : ", sum(is_numeric), "\n")
+  cat("[ID-FILTER]   Overly long names : ", sum(is_too_long & !is_genbank & !is_refseq & !is_numeric), "\n")
+
+  ## Safety: ensure key genes survive
+  key_survival <- c("UCP1", "CLDN1", "ACTB", "GAPDH", "PPARG", "LEP")
+  for (kg in key_survival) {
+    if (kg %in% gene_ids_all[is_junk]) {
+      cat("[ID-FILTER] WARNING:", kg, "would be removed — overriding to keep it\n")
+      is_junk[gene_ids_all == kg] <- FALSE
+    }
+  }
+
+  if (n_junk > 0) {
+    se <- se[!is_junk, ]
+    cat("[ID-FILTER] Kept", nrow(se), "genes after removing", n_junk, "non-standard IDs\n")
+  } else {
+    cat("[ID-FILTER] All gene IDs look standard — no removal needed\n")
+  }
+
+  sanity$n_genes_after_id_filter <- nrow(se)
+
   ## ---- 4.2) Pre-filtering --------------------------------
   cat("\n== 4.2  Pre-filtering low-count genes ==\n")
 
@@ -589,20 +713,141 @@ tryCatch({
     se_filt <- se
   }
 
+  ## ---- Sanity block B: Post-filter diagnostics ----
+  cat("\n--- SANITY BLOCK B: Post-filter diagnostics ---\n")
+
   sanity$n_genes_filtered <- nrow(se_filt)
+  filt_counts <- assay(se_filt, "counts")
+
+  ## B1. Dimension check
+  cat("[B1] Filtered matrix: ", nrow(se_filt), " genes x ", ncol(se_filt), " samples\n", sep = "")
+
+  ## B2. Hard cap — if still >30K genes, something is wrong; do a second-pass
+  MAX_GENES_FOR_DESEQ <- 30000
+  if (nrow(se_filt) > MAX_GENES_FOR_DESEQ) {
+    cat("[B2] WARNING: ", nrow(se_filt), " genes exceeds hard cap of ",
+        MAX_GENES_FOR_DESEQ, "\n", sep = "")
+    cat("[B2] Applying second-pass filter: keeping top genes by mean expression\n")
+    row_means <- rowMeans(filt_counts)
+    keep_top  <- order(row_means, decreasing = TRUE)[seq_len(MAX_GENES_FOR_DESEQ)]
+    cutoff_mean <- row_means[keep_top[MAX_GENES_FOR_DESEQ]]
+    se_filt <- se_filt[keep_top, ]
+    filt_counts <- assay(se_filt, "counts")
+    cat("[B2] Second-pass filter: kept ", nrow(se_filt), " genes (mean count cutoff >= ",
+        round(cutoff_mean, 1), ")\n", sep = "")
+    sanity$n_genes_filtered <- nrow(se_filt)
+    sanity$second_pass_filter <- TRUE
+  } else {
+    cat("[B2] Gene count (", nrow(se_filt), ") is within safe range for DESeq2\n", sep = "")
+    sanity$second_pass_filter <- FALSE
+  }
+
+  ## B3. Library sizes after filtering
+  filt_lib <- colSums(filt_counts, na.rm = TRUE)
+  cat("[B3] Post-filter library sizes:\n")
+  cat("     min =", format(min(filt_lib), big.mark = ","),
+      " median =", format(median(filt_lib), big.mark = ","),
+      " max =", format(max(filt_lib), big.mark = ","), "\n")
+
+  ## B4. Key gene survival check
+  cat("[B4] Key gene survival after filtering:\n")
+  filt_gene_ids <- rownames(se_filt)
+  for (kg in c("UCP1", "CLDN1", "ACTB", "GAPDH", "PPARG", "LEP",
+               BAT_MARKER_GENES[1:3], WAT_MARKER_GENES[1:3])) {
+    status <- if (kg %in% filt_gene_ids) "PRESENT" else "REMOVED"
+    cat("     ", kg, ": ", status, "\n", sep = "")
+  }
+
+  ## B5. Count distribution summary
+  filt_row_sums <- rowSums(filt_counts, na.rm = TRUE)
+  cat("[B5] Filtered gene count distribution:\n")
+  cat("     Quantiles: ", paste(
+    names(quantile(filt_row_sums, c(0, 0.05, 0.25, 0.5, 0.75, 0.95, 1))),
+    "=", format(quantile(filt_row_sums, c(0, 0.05, 0.25, 0.5, 0.75, 0.95, 1)), big.mark = ","),
+    collapse = "  "), "\n")
+
+  cat("--- END SANITY BLOCK B ---\n\n")
 
   ## ---- 4.3) DESeq2 — paired design ----------------------
   cat("\n== 4.3  DESeq2 paired analysis ==\n")
 
+  ## Sanity block C: Pre-DESeq2 diagnostics
+  cat("--- SANITY BLOCK C: Pre-DESeq2 diagnostics ---\n")
+
+  n_genes_for_deseq <- nrow(se_filt)
+  n_samples_for_deseq <- ncol(se_filt)
+  n_subjects_for_deseq <- nlevels(se_filt$subject)
+
+  ## C1. Design matrix dimensions
+  ## Design ~ subject + tissue: ncol = n_subjects + 1 (tissue)
+  ## (intercept absorbed into subject coding)
+  design_cols <- n_subjects_for_deseq  # subject levels - 1 + intercept + tissue = n_subjects + 1
+  cat("[C1] Design: ~ subject + tissue\n")
+  cat("     Subjects: ", n_subjects_for_deseq, " | Samples: ", n_samples_for_deseq, "\n", sep = "")
+  cat("     Approximate design matrix: ", n_samples_for_deseq, " x ", design_cols + 1, "\n", sep = "")
+
+  ## C2. Memory estimate (rough: DESeq2 needs ~8 bytes * genes * samples * 4 matrices)
+  mem_est_mb <- (8 * n_genes_for_deseq * n_samples_for_deseq * 6) / (1024^2)
+  cat("[C2] Estimated DESeq2 memory: ~", round(mem_est_mb, 0), " MB for core matrices\n", sep = "")
+  avail_mem <- tryCatch({
+    meminfo <- readLines("/proc/meminfo", n = 3)
+    avail_line <- grep("MemAvailable", meminfo, value = TRUE)
+    if (length(avail_line) > 0) {
+      avail_kb <- as.numeric(gsub("[^0-9]", "", avail_line))
+      round(avail_kb / 1024)
+    } else NA
+  }, error = function(e) NA)
+  if (!is.na(avail_mem)) {
+    cat("[C2] Available system memory: ~", avail_mem, " MB\n", sep = "")
+    if (mem_est_mb > avail_mem * 0.5) {
+      cat("[C2] WARNING: DESeq2 may consume >50% of available memory!\n")
+    }
+  }
+
+  ## C3. Time estimate (empirical: ~0.5-2 sec per 1000 genes for paired design)
+  time_est_min <- n_genes_for_deseq / 1000 * 1.5 / 60
+  cat("[C3] Estimated DESeq2 runtime: ~", round(time_est_min, 1), " minutes\n", sep = "")
+  if (time_est_min > 30) {
+    cat("[C3] WARNING: This will take a LONG time. Consider more aggressive filtering.\n")
+  }
+
+  cat("--- END SANITY BLOCK C ---\n\n")
+
   dds <- DESeqDataSet(se_filt, design = ~ subject + tissue)
   dds$tissue <- relevel(dds$tissue, ref = CONDITION_REF)
 
+  cat("[INFO] Starting DESeq2 at:", format(Sys.time(), "%H:%M:%S"), "\n")
+  deseq_start <- Sys.time()
+
   ## Run DESeq2 (or load from cache)
+  ## C4. Cache validation: invalidate if gene count changed (e.g. new filters)
   if (use_save_core) {
+    cached_dds_path <- file.path(cache_dir, "dds_BAT_vs_WAT.rds")
+    if (file.exists(cached_dds_path)) {
+      cached_dds <- readRDS(cached_dds_path)
+      cached_ngenes <- nrow(cached_dds)
+      if (cached_ngenes != nrow(dds)) {
+        cat("[C4] CACHE STALE: cached DESeq2 has", cached_ngenes,
+            "genes but current filter yields", nrow(dds), "\n")
+        cat("[C4] Removing stale cache to force recompute\n")
+        file.remove(cached_dds_path)
+        ## Also remove stale VST cache
+        vst_cache_path <- file.path(cache_dir, "vst_counts.rds")
+        if (file.exists(vst_cache_path)) file.remove(vst_cache_path)
+      } else {
+        cat("[C4] Cache gene count matches (", cached_ngenes, ") — using cache\n", sep = "")
+      }
+      rm(cached_dds)
+    }
     dds <- cache_deseq(dds, cache_dir, contrast_name = "BAT_vs_WAT")
   } else {
     dds <- DESeq(dds)
   }
+
+  deseq_elapsed <- difftime(Sys.time(), deseq_start, units = "mins")
+  cat("[INFO] DESeq2 finished at:", format(Sys.time(), "%H:%M:%S"),
+      "(", round(as.numeric(deseq_elapsed), 1), "min )\n")
+  sanity$deseq_runtime_min <- round(as.numeric(deseq_elapsed), 2)
 
   ## Extract results
   res <- results(dds,
@@ -1200,7 +1445,11 @@ tryCatch({
     check = c(
       "Samples loaded",
       "Subjects detected",
-      "Genes after filtering",
+      "Genes raw (before any filter)",
+      "Genes after ID filter",
+      "Genes after count filter",
+      "Second-pass filter applied",
+      "DESeq2 runtime (min)",
       "BAT-enriched genes (paper: 463)",
       "UCP1 verdict",
       "UCP1 log2FC",
@@ -1212,7 +1461,11 @@ tryCatch({
     expected = c(
       N_SAMPLES_EXPECTED,
       N_SUBJECTS,
-      "> 10000",
+      "~217000 (GEO file)",
+      "~20000-40000",
+      "15000-25000",
+      "FALSE (ideally)",
+      "< 10",
       paste0(EXPECTED_UP_BAT, " +/- ", DEG_COUNT_TOLERANCE * 100, "%"),
       "UP_IN_BAT_SIGNIFICANT",
       "> 0",
@@ -1224,7 +1477,11 @@ tryCatch({
     observed = c(
       sanity$n_samples,
       sanity$n_subjects,
+      sanity$n_genes_raw,
+      ifelse(!is.null(sanity$n_genes_after_id_filter), sanity$n_genes_after_id_filter, "N/A"),
       sanity$n_genes_filtered,
+      ifelse(!is.null(sanity$second_pass_filter), sanity$second_pass_filter, "N/A"),
+      ifelse(!is.null(sanity$deseq_runtime_min), sanity$deseq_runtime_min, "N/A"),
       sanity$n_up_bat,
       ifelse(is.null(sanity$ucp1_verdict), "NA", sanity$ucp1_verdict),
       ifelse(isTRUE(sanity$ucp1_found), round(sanity$ucp1_lfc, 3), "NOT_FOUND"),

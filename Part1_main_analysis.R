@@ -128,6 +128,9 @@ print_run_structure_sanity <- function(outdir) {
 normalize_sample_id <- function(x) {
   x <- as.character(x)
   x <- tolower(x)
+  ## Transliterate accented characters to ASCII (ä→a, ö→o, etc.)
+  ## before stripping, so Finnish names like "Päoi" match correctly.
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
   gsub("[^a-z0-9]", "", x)
 }
 
@@ -824,15 +827,57 @@ tryCatch({
   counts_mat[counts_mat < 0] <- 0
   counts_mat <- round(counts_mat)
 
+  ## ---- Detect and correct grossly inflated counts ----
+  ## Some GEO datasets (e.g. Genomatix pipeline output) have weighted/scaled
+  ## counts that are 1000-100000x larger than raw read counts.  This causes:
+  ##   (a) integer overflow (R integer max = 2.1 billion)
+  ##   (b) poor DESeq2 dispersion estimation (expects raw count scale)
+  ##   (c) artificially conservative p-values -> fewer DEGs
+  ## Fix: proportionally scale ALL counts so median library size is ~20M.
+  ## This preserves fold-changes and relative proportions exactly.
+  pre_scale_lib <- colSums(counts_mat)
+  pre_scale_median <- median(pre_scale_lib)
+
+  if (pre_scale_median > 1e9) {
+    target_lib_size <- 2e7  # 20 million — typical RNA-seq
+    scale_factor <- pre_scale_median / target_lib_size
+    cat("[SCALE] Median library size is ", format(pre_scale_median, big.mark = ","),
+        " — this is ", round(scale_factor), "x above typical RNA-seq.\n", sep = "")
+    cat("[SCALE] Data appears to be weighted/scaled counts (e.g. Genomatix),\n")
+    cat("        not raw read counts.  Proportionally scaling down by ",
+        round(scale_factor), "x\n", sep = "")
+    cat("[SCALE] to target ~", format(target_lib_size, big.mark = ","),
+        " median library size.\n", sep = "")
+    cat("[SCALE] This preserves all fold-changes and relative proportions.\n")
+
+    counts_mat <- round(counts_mat / scale_factor)
+
+    post_scale_lib <- colSums(counts_mat)
+    cat("[SCALE] Post-scaling library sizes: min=",
+        format(min(post_scale_lib), big.mark = ","),
+        " median=", format(median(post_scale_lib), big.mark = ","),
+        " max=", format(max(post_scale_lib), big.mark = ","), "\n", sep = "")
+
+    ## Verify key genes survived the scaling
+    for (kg in c("UCP1", "CLDN1", "ACTB")) {
+      if (kg %in% rownames(counts_mat)) {
+        kg_mean <- round(mean(counts_mat[kg, ]))
+        cat("[SCALE] ", kg, " mean count after scaling: ",
+            format(kg_mean, big.mark = ","), "\n", sep = "")
+      }
+    }
+
+    sanity$count_scale_factor <- round(scale_factor)
+  } else {
+    sanity$count_scale_factor <- 1
+  }
+
+  ## Final integer overflow check (should be rare/none after scaling)
   int_max <- .Machine$integer.max
   n_overflow <- sum(counts_mat > int_max)
   if (n_overflow > 0) {
-    overflow_idx <- which(counts_mat > int_max, arr.ind = TRUE)
-    cat("[SANITY] Capping", n_overflow, "count values above integer max at", int_max, "\n")
-    cat("[SANITY] Overflow in gene(s):",
-        paste(head(rownames(counts_mat)[overflow_idx[, 1]], 3), collapse = ", "), "\n")
-    cat("[SANITY] Overflow in sample(s):",
-        paste(head(colnames(counts_mat)[overflow_idx[, 2]], 3), collapse = ", "), "\n")
+    cat("[SANITY] WARNING: ", n_overflow,
+        " values still exceed integer max after scaling — capping\n", sep = "")
     counts_mat[counts_mat > int_max] <- int_max
   }
 
@@ -1838,6 +1883,7 @@ tryCatch({
     check = c(
       "Samples loaded",
       "Subjects detected",
+      "Count scale factor applied",
       "Genes raw (before any filter)",
       "Genes after count filter (CPM>=1)",
       "Second-pass filter applied",
@@ -1853,6 +1899,7 @@ tryCatch({
     expected = c(
       N_SAMPLES_EXPECTED,
       N_SUBJECTS,
+      "1 (raw counts) or >1 (scaled)",
       "~217000 (GEO file)",
       "15000-25000",
       "FALSE (ideally)",
@@ -1868,6 +1915,7 @@ tryCatch({
     observed = c(
       sanity$n_samples,
       sanity$n_subjects,
+      ifelse(!is.null(sanity$count_scale_factor), sanity$count_scale_factor, 1),
       sanity$n_genes_raw,
       sanity$n_genes_filtered,
       ifelse(!is.null(sanity$second_pass_filter), sanity$second_pass_filter, "N/A"),

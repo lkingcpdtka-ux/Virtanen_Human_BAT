@@ -1223,11 +1223,94 @@ tryCatch({
   sanity$n_up_wat <- sum(res_df$padj < PADJ_CUTOFF &
                           res_df$log2FoldChange <= -LFC_CUTOFF, na.rm = TRUE)
 
+  ## ---- 4.3b) Influence analysis for potential excluded subject ---
+  ## The paper reports 14 paired subjects while GEO provides 15.
+  ## Run leave-one-subject-out (LOSO) DE to identify which subject,
+  ## when excluded, best reproduces the reported BAT-enriched DEG count.
+  cat("\n== 4.3b  Subject influence (LOSO) diagnostics ==\n")
+
+  loso_tbl <- NULL
+  loso_subjects <- levels(dds$subject)
+  if (length(loso_subjects) >= 6 && length(loso_subjects) <= 20) {
+    cat("[LOSO] Running", length(loso_subjects), "re-fits (exclude one subject each)\n")
+    loso_tbl <- data.frame(
+      excluded_subject = loso_subjects,
+      n_subjects_used  = NA_integer_,
+      n_samples_used   = NA_integer_,
+      n_up_bat         = NA_integer_,
+      n_up_wat         = NA_integer_,
+      stringsAsFactors = FALSE
+    )
+
+    for (i in seq_along(loso_subjects)) {
+      subj <- loso_subjects[i]
+      keep_i <- dds$subject != subj
+      dds_i <- dds[, keep_i]
+      dds_i$subject <- droplevels(dds_i$subject)
+
+      dds_i <- DESeq(dds_i, quiet = TRUE)
+      res_i <- results(dds_i,
+                       contrast = c("tissue", CONDITION_TEST, CONDITION_REF),
+                       alpha = PADJ_CUTOFF)
+
+      up_bat_i <- sum(res_i$padj < PADJ_CUTOFF &
+                        res_i$log2FoldChange >= LFC_CUTOFF,
+                      na.rm = TRUE)
+      up_wat_i <- sum(res_i$padj < PADJ_CUTOFF &
+                        res_i$log2FoldChange <= -LFC_CUTOFF,
+                      na.rm = TRUE)
+
+      loso_tbl$n_subjects_used[i] <- nlevels(dds_i$subject)
+      loso_tbl$n_samples_used[i]  <- ncol(dds_i)
+      loso_tbl$n_up_bat[i]        <- up_bat_i
+      loso_tbl$n_up_wat[i]        <- up_wat_i
+      cat(sprintf("[LOSO] Excluding %-12s => BAT-up: %4d | WAT-up: %4d\n",
+                  as.character(subj), up_bat_i, up_wat_i))
+    }
+
+    loso_tbl$delta_up_bat_vs_full <- loso_tbl$n_up_bat - sanity$n_up_bat
+    loso_tbl$abs_delta_vs_paper <- abs(loso_tbl$n_up_bat - EXPECTED_UP_BAT)
+    loso_tbl <- loso_tbl[order(loso_tbl$abs_delta_vs_paper,
+                               -loso_tbl$n_up_bat,
+                               loso_tbl$excluded_subject), ]
+
+    best_match <- loso_tbl[1, ]
+    sanity$loso_best_subject <- best_match$excluded_subject
+    sanity$loso_best_up_bat  <- best_match$n_up_bat
+    sanity$loso_bat_range <- paste0(min(loso_tbl$n_up_bat), "-", max(loso_tbl$n_up_bat))
+    sanity$loso_bat_sd <- round(sd(loso_tbl$n_up_bat), 2)
+
+    cat("[LOSO] BAT-up range across exclusions:",
+        min(loso_tbl$n_up_bat), "to", max(loso_tbl$n_up_bat),
+        "(SD", round(sd(loso_tbl$n_up_bat), 2), ")\n")
+    cat("[LOSO] Best match to paper (", EXPECTED_UP_BAT, ") is excluding subject '",
+        best_match$excluded_subject, "' -> ", best_match$n_up_bat,
+        " BAT-up genes\n", sep = "")
+
+    if (sd(loso_tbl$n_up_bat) > 0 &&
+        (max(loso_tbl$n_up_bat) - min(loso_tbl$n_up_bat)) > 2 * sd(loso_tbl$n_up_bat)) {
+      cat("[LOSO] WARNING: DEG counts are sensitive to subject exclusion.\n")
+      cat("       Report full-cohort and exclusion-based results to avoid selection bias.\n")
+      sanity$loso_bias_flag <- "SENSITIVE"
+    } else {
+      cat("[LOSO] OK: No single subject dominates DEG count recovery.\n")
+      sanity$loso_bias_flag <- "STABLE"
+    }
+  } else {
+    cat("[LOSO] Skipped (subject count outside 6-20 range)\n")
+    sanity$loso_bias_flag <- "SKIPPED"
+  }
+
   ## Compare to paper
   cat("[PAPER] Virtanen et al. report", EXPECTED_UP_BAT,
       "BAT-enriched genes (14 subjects)\n")
   cat("[PAPER] This run:", sanity$n_up_bat, "BAT-enriched genes (",
       nlevels(se_filt$subject), "subjects)\n")
+  if (!is.null(loso_tbl) && nrow(loso_tbl) > 0) {
+    cat("[PAPER] Closest 14-subject reconstruction: exclude",
+        sanity$loso_best_subject, "->", sanity$loso_best_up_bat,
+        "BAT-enriched genes\n")
+  }
   if (abs(sanity$n_up_bat - EXPECTED_UP_BAT) / EXPECTED_UP_BAT <= DEG_COUNT_TOLERANCE) {
     cat("[PAPER] Within", DEG_COUNT_TOLERANCE * 100, "% tolerance\n")
   } else {
@@ -1558,6 +1641,14 @@ tryCatch({
   cat("[SAVED]", deg_lists_file, "\n")
   verify_output_file(file.path(outdir, "tables", deg_lists_file), "DEG list RDS")
 
+  ## Subject influence table (identify candidate excluded subject from paper)
+  if (!is.null(loso_tbl) && nrow(loso_tbl) > 0) {
+    loso_file <- paste0("LOSO_subject_influence_", run_tag, ".csv")
+    write.csv(loso_tbl, file = file.path(outdir, "tables", loso_file), row.names = FALSE)
+    cat("[SAVED]", loso_file, "\n")
+    verify_output_file(file.path(outdir, "tables", loso_file), "LOSO CSV")
+  }
+
   ## Save VST matrix for downstream parts
   vst_file <- paste0("VST_matrix_", run_tag, ".rds")
   saveRDS(list(vst_mat = vst_mat, col_data = colData(dds)),
@@ -1864,6 +1955,12 @@ tryCatch({
     cldn1_lfc     = ifelse(sanity$cldn1_found, round(sanity$cldn1_lfc, 4), NA),
     cldn1_padj    = ifelse(sanity$cldn1_found, signif(sanity$cldn1_padj, 4), NA),
     cldn1_verdict = sanity$cldn1_verdict,
+    loso_best_excluded_subject = ifelse(!is.null(sanity$loso_best_subject),
+                                        sanity$loso_best_subject, NA),
+    loso_best_up_bat = ifelse(!is.null(sanity$loso_best_up_bat),
+                              sanity$loso_best_up_bat, NA),
+    loso_bias_flag = ifelse(!is.null(sanity$loso_bias_flag),
+                            sanity$loso_bias_flag, NA),
     cldn1_ucp1_rho = ifelse(!is.null(sanity$cldn1_ucp1_rho),
                              round(sanity$cldn1_ucp1_rho, 4), NA),
     stringsAsFactors = FALSE
@@ -1889,6 +1986,9 @@ tryCatch({
       "Second-pass filter applied",
       "DESeq2 runtime (min)",
       "BAT-enriched genes (paper: 463)",
+      "LOSO BAT-up range (exclude 1 subject)",
+      "Best-match excluded subject (paper alignment)",
+      "LOSO bias stability flag",
       "UCP1 verdict",
       "UCP1 log2FC",
       "UCP1 padj",
@@ -1905,6 +2005,9 @@ tryCatch({
       "FALSE (ideally)",
       "< 10",
       paste0(EXPECTED_UP_BAT, " +/- ", DEG_COUNT_TOLERANCE * 100, "%"),
+      "narrow range",
+      "paper-closest candidate",
+      "STABLE",
       "UP_IN_BAT_SIGNIFICANT",
       "> 0",
       "< 0.05",
@@ -1921,6 +2024,9 @@ tryCatch({
       ifelse(!is.null(sanity$second_pass_filter), sanity$second_pass_filter, "N/A"),
       ifelse(!is.null(sanity$deseq_runtime_min), sanity$deseq_runtime_min, "N/A"),
       sanity$n_up_bat,
+      ifelse(!is.null(sanity$loso_bat_range), sanity$loso_bat_range, "N/A"),
+      ifelse(!is.null(sanity$loso_best_subject), sanity$loso_best_subject, "N/A"),
+      ifelse(!is.null(sanity$loso_bias_flag), sanity$loso_bias_flag, "N/A"),
       ifelse(is.null(sanity$ucp1_verdict), "NA", sanity$ucp1_verdict),
       ifelse(isTRUE(sanity$ucp1_found), round(sanity$ucp1_lfc, 3), "NOT_FOUND"),
       ifelse(isTRUE(sanity$ucp1_found), signif(sanity$ucp1_padj, 4), "NOT_FOUND"),

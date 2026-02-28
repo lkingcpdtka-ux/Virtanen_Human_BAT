@@ -102,6 +102,63 @@ read_geo_counts_with_fallback <- function(path, is_gz = FALSE) {
        ". Please provide a plain text count table via LOCAL_COUNTS_PATH.")
 }
 
+download_ncbi_counts <- function(geo_accession, dest_dir) {
+  ## Download NCBI-generated RNA-seq raw counts (GRCh38.p13 pipeline).
+  ## These are standardised count tables produced by NCBI's pipeline,
+
+  ## separate from the author-submitted supplementary files.
+  fname <- paste0(geo_accession, "_raw_counts_GRCh38.p13_NCBI")
+  dest  <- file.path(dest_dir, fname)
+  if (file.exists(dest)) {
+    cat("[INFO] NCBI counts file already downloaded:", basename(dest), "\n")
+    return(dest)
+  }
+  url <- paste0("https://www.ncbi.nlm.nih.gov/geo/download/?type=rnaseq_counts",
+                "&acc=", geo_accession,
+                "&format=file",
+                "&file=", fname)
+  cat("[INFO] Downloading NCBI-generated counts from:\n       ", url, "\n")
+  status <- tryCatch({
+    download.file(url, dest, mode = "wb", quiet = FALSE)
+    0L
+  }, error = function(e) {
+    warning("[WARN] NCBI counts download failed: ", conditionMessage(e))
+    1L
+  })
+  if (status != 0 || !file.exists(dest) || file.size(dest) < 100) {
+    if (file.exists(dest)) file.remove(dest)
+    return(NULL)
+  }
+  cat("[INFO] Downloaded NCBI counts:", basename(dest),
+      "(", round(file.size(dest) / 1024), "KB )\n")
+  return(dest)
+}
+
+convert_entrez_to_symbol <- function(entrez_ids) {
+  ## Map NCBI Entrez Gene IDs to HGNC symbols using org.Hs.eg.db.
+  if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    stop("org.Hs.eg.db is required for Entrez-to-symbol conversion. ",
+         "Install with: BiocManager::install('org.Hs.eg.db')")
+  }
+  if (!requireNamespace("AnnotationDbi", quietly = TRUE)) {
+    stop("AnnotationDbi is required for Entrez-to-symbol conversion.")
+  }
+  entrez_ids <- as.character(entrez_ids)
+  mapped <- AnnotationDbi::mapIds(
+    org.Hs.eg.db::org.Hs.eg.db,
+    keys    = entrez_ids,
+    column  = "SYMBOL",
+    keytype = "ENTREZID",
+    multiVals = "first"
+  )
+  symbols <- as.character(mapped[entrez_ids])
+  n_mapped  <- sum(!is.na(symbols))
+  n_total   <- length(entrez_ids)
+  cat("[INFO] Entrez-to-symbol mapping: ", n_mapped, " / ", n_total,
+      " (", round(100 * n_mapped / n_total, 1), "%) mapped\n", sep = "")
+  symbols
+}
+
 verify_output_file <- function(path, label = "output", must_exist = TRUE) {
   ok <- file.exists(path)
   if (ok) {
@@ -212,12 +269,21 @@ find_local_count_file <- function(geo_accession, workdir) {
     warning("[WARN] LOCAL_COUNTS_PATH was set but not found: ", LOCAL_COUNTS_PATH)
   }
 
+  ## Match NCBI counts file (with or without extension) and other common patterns
   candidates <- list.files(
     workdir,
-    pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv)(\\.gz)?$"),
+    pattern = paste0("^", geo_accession, ".*raw_counts_GRCh38.*NCBI"),
     full.names = TRUE,
     ignore.case = TRUE
   )
+  if (length(candidates) == 0) {
+    candidates <- list.files(
+      workdir,
+      pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv|tsv)(\\.gz)?$"),
+      full.names = TRUE,
+      ignore.case = TRUE
+    )
+  }
 
   if (length(candidates) > 0) {
     cat("[INFO] Found local count file candidate:", basename(candidates[1]), "\n")
@@ -455,24 +521,29 @@ tryCatch({
     gse <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, getGPL = FALSE)
     gse <- gse[[1]]
 
-    ## Try local counts first; otherwise download GEO supplementary file
+    ## Try local counts first; then download NCBI-generated counts
     supp_dir <- file.path(cache_dir, "geo_supp")
     dir.create(supp_dir, recursive = TRUE, showWarnings = FALSE)
 
     local_count_file <- find_local_count_file(GEO_ACCESSION, getwd())
     count_file <- NULL
+    is_ncbi_counts <- FALSE
 
     if (!is.null(local_count_file)) {
       count_file <- local_count_file
+      ## Detect if local file is an NCBI-generated counts file
+      is_ncbi_counts <- grepl("raw_counts_GRCh38.*NCBI", basename(count_file), ignore.case = TRUE)
     } else {
-      supp_files <- getGEOSuppFiles(GEO_ACCESSION, baseDir = supp_dir,
-                                     makeDirectory = FALSE)
-
-      count_candidates <- rownames(supp_files)[grepl("count|raw|humanBATWAT|txt|csv",
-                                                     rownames(supp_files),
-                                                     ignore.case = TRUE)]
-      if (length(count_candidates) > 0) {
-        count_file <- count_candidates[1]
+      ## Download NCBI-generated raw counts (standardised GRCh38.p13 pipeline)
+      ncbi_file <- download_ncbi_counts(GEO_ACCESSION, supp_dir)
+      if (!is.null(ncbi_file)) {
+        count_file <- ncbi_file
+        is_ncbi_counts <- TRUE
+      } else {
+        stop("Could not download NCBI-generated counts file for ", GEO_ACCESSION,
+             ". Download GSE113764_raw_counts_GRCh38.p13_NCBI manually from\n",
+             "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE113764\n",
+             "and place it in the working directory, or set LOCAL_COUNTS_PATH.")
       }
     }
 
@@ -488,35 +559,97 @@ tryCatch({
              ". If this is a gzipped file without .gz extension, recompress/rename or set LOCAL_COUNTS_PATH correctly.")
       }
 
-      ## ---- Smart gene-ID extraction ----
-      ## GEO count files vary in structure.  Common layouts:
-      ##   (a) col1 = ENSG/symbol, rest = counts
-      ##   (b) col1 = transcript accession, "Symbol" col has gene names, rest = counts
-      ## We prefer a "Symbol" column if it contains recognisable gene names.
+      ## ---- NCBI counts sanity gate ----
+      ## Verify the file looks like NCBI-generated counts before proceeding
+      if (is_ncbi_counts) {
+        cn_raw <- colnames(counts_raw)
+        cat("\n--- NCBI COUNTS INTAKE CHECK ---\n")
+        cat("[NCBI-CHK] File: ", basename(count_file), "\n", sep = "")
+        cat("[NCBI-CHK] Dimensions: ", nrow(counts_raw), " rows x ",
+            ncol(counts_raw), " cols\n", sep = "")
+        cat("[NCBI-CHK] Column names: ", paste(head(cn_raw, 15), collapse = ", "),
+            if (length(cn_raw) > 15) " ..." else "", "\n", sep = "")
+
+        ## Check col1 contains numeric Entrez IDs
+        col1_vals <- head(as.character(counts_raw[[1]]), 20)
+        n_numeric_ids <- sum(grepl("^[0-9]+$", col1_vals))
+        cat("[NCBI-CHK] Col1 sample values: ", paste(head(col1_vals, 8), collapse = ", "), "\n", sep = "")
+        cat("[NCBI-CHK] Col1 numeric (Entrez-like): ", n_numeric_ids, "/",
+            length(col1_vals), "\n", sep = "")
+        if (n_numeric_ids < length(col1_vals) * 0.8) {
+          stop("[NCBI-CHK] FAIL: Column 1 does not contain Entrez Gene IDs. ",
+               "This does not look like an NCBI-generated counts file. ",
+               "Check that you downloaded the correct file from GEO.")
+        }
+
+        ## Check remaining columns are GSM sample IDs
+        sample_cols <- cn_raw[-1]
+        n_gsm <- sum(grepl("^GSM[0-9]+", sample_cols))
+        cat("[NCBI-CHK] Sample columns matching GSM pattern: ", n_gsm, "/",
+            length(sample_cols), "\n", sep = "")
+        if (n_gsm == 0 && length(sample_cols) > 0) {
+          cat("[NCBI-CHK] WARNING: No GSM-prefixed columns found. ",
+              "Column names: ", paste(head(sample_cols, 5), collapse = ", "), "\n", sep = "")
+        }
+
+        ## Check expected row count range (human genome ~20K-60K Entrez IDs)
+        if (nrow(counts_raw) < 5000) {
+          cat("[NCBI-CHK] WARNING: Only ", nrow(counts_raw),
+              " rows — expected 20K-60K for human genome.\n", sep = "")
+        } else if (nrow(counts_raw) >= 15000 && nrow(counts_raw) <= 65000) {
+          cat("[NCBI-CHK] OK: Row count (", nrow(counts_raw),
+              ") in expected range for human Entrez IDs.\n", sep = "")
+        }
+
+        ## Spot-check: values should be integer-like raw counts
+        test_vals <- as.numeric(unlist(counts_raw[1:min(100, nrow(counts_raw)), -1, drop = FALSE]))
+        test_vals <- test_vals[!is.na(test_vals)]
+        if (length(test_vals) > 0) {
+          frac_integer <- mean(test_vals == floor(test_vals))
+          cat("[NCBI-CHK] Fraction of integer values (first 100 rows): ",
+              round(frac_integer * 100, 1), "%\n", sep = "")
+          if (frac_integer < 0.95) {
+            cat("[NCBI-CHK] WARNING: Values are not all integers — ",
+                "may not be raw counts.\n", sep = "")
+          }
+          cat("[NCBI-CHK] Value range (first 100 rows): ",
+              format(min(test_vals), big.mark = ","), " - ",
+              format(max(test_vals), big.mark = ","), "\n", sep = "")
+          if (max(test_vals) > 1e7) {
+            cat("[NCBI-CHK] WARNING: Max value > 10M in first 100 rows — ",
+                "may be pre-scaled, not raw counts.\n", sep = "")
+          }
+        }
+        cat("--- END NCBI COUNTS INTAKE CHECK ---\n\n")
+      }
+
+      ## ---- Gene-ID extraction ----
       cn <- colnames(counts_raw)
 
-      ## Look for a dedicated Symbol / GeneName column
-      symbol_col_idx <- grep("^(symbol|gene[._]?name|gene[._]?symbol|hgnc)$",
-                              cn, ignore.case = TRUE)
-
-      if (length(symbol_col_idx) > 0) {
-        ## Found a Symbol column  use it as the gene identifier
-        sym_idx <- symbol_col_idx[1]
-        gene_col <- as.character(counts_raw[[sym_idx]])
-        cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
-
-        ## Drop the first column (accession) and the Symbol column.
-        ## All remaining column filtering (numeric detection, BAT/WAT
-        ## pattern matching) is handled by select_numeric_count_columns().
-        cols_to_drop <- sort(unique(c(1, sym_idx)))
-        dropped_names <- cn[cols_to_drop]
-        cat("[INFO] Dropping identifier columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
-        counts_raw <- counts_raw[, -cols_to_drop, drop = FALSE]
-      } else {
-        ## No Symbol column  fall back to col1 as gene identifier
-        gene_col <- as.character(counts_raw[[1]])
+      if (is_ncbi_counts) {
+        ## NCBI counts: col1 = GeneID (Entrez), rest = GSM sample columns
+        entrez_ids <- as.character(counts_raw[[1]])
         counts_raw <- counts_raw[, -1, drop = FALSE]
-        cat("[INFO] No 'Symbol' column found; using column 1 as gene identifier\n")
+        cat("[INFO] NCBI counts detected: converting Entrez Gene IDs to HGNC symbols\n")
+        gene_col <- convert_entrez_to_symbol(entrez_ids)
+      } else {
+        ## Author-submitted files: try Symbol column, else use col1
+        symbol_col_idx <- grep("^(symbol|gene[._]?name|gene[._]?symbol|hgnc)$",
+                                cn, ignore.case = TRUE)
+
+        if (length(symbol_col_idx) > 0) {
+          sym_idx <- symbol_col_idx[1]
+          gene_col <- as.character(counts_raw[[sym_idx]])
+          cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
+          cols_to_drop <- sort(unique(c(1, sym_idx)))
+          dropped_names <- cn[cols_to_drop]
+          cat("[INFO] Dropping identifier columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
+          counts_raw <- counts_raw[, -cols_to_drop, drop = FALSE]
+        } else {
+          gene_col <- as.character(counts_raw[[1]])
+          counts_raw <- counts_raw[, -1, drop = FALSE]
+          cat("[INFO] No 'Symbol' column found; using column 1 as gene identifier\n")
+        }
       }
 
       counts_raw <- select_numeric_count_columns(as.data.frame(counts_raw))
@@ -652,11 +785,6 @@ tryCatch({
         }
       }
       cat("--- END SANITY BLOCK A ---\n\n")
-
-    } else {
-      ## Fallback: use exprs() from the GEO Series Matrix
-      cat("[INFO] No count file found; using Series Matrix expression data\n")
-      counts_raw <- as.data.frame(exprs(gse))
     }
 
     ## Build sample metadata from GEO phenoData
@@ -873,6 +1001,15 @@ tryCatch({
 
   bat_status_by_sample <- parsed_meta$BAT_status
   names(bat_status_by_sample) <- parsed_meta$sample_id
+
+  ## Attach BAT_status to SE colData so stratified models can use it
+  bat_status_vec <- bat_status_by_sample[colnames(se)]
+  if (sum(!is.na(bat_status_vec)) > 0) {
+    colData(se)$BAT_status <- factor(bat_status_vec)
+    cat("[INFO] BAT_status added to colData: ",
+        paste(names(table(colData(se)$BAT_status)), "=",
+              table(colData(se)$BAT_status), collapse = ", "), "\n")
+  }
 
   ## ---- Sanity: are these raw counts or pre-normalised? ----
   ## Raw counts are integers >= 0 with most values in hundreds-thousands range.
@@ -1454,6 +1591,317 @@ tryCatch({
       "BAT-enriched genes from 14 subjects; this script keeps all paired subjects by default.\n")
   cat("[PAPER] Current cohort:", nlevels(se_filt$subject), "subjects |",
       ncol(se_filt), "samples\n")
+
+  ## ---- 4.3c) Stratified analysis: active vs inactive BAT ----
+  cat("\n== 4.3c  Stratified DESeq2: active-BAT vs inactive-BAT ==\n")
+  cat("[STRAT] Study design: subjects classified by PET-CT 18F-FDG uptake\n")
+  cat("        9 active BAT (pos) + 6 inactive BAT (neg)\n")
+  cat("        Key question: Is CLDN1 up in BAT specifically in\n")
+  cat("        subjects with cold-activated brown fat?\n\n")
+
+  if ("BAT_status" %in% colnames(colData(se_filt)) &&
+      sum(!is.na(colData(se_filt)$BAT_status)) > 0) {
+
+    ## Determine subject-level BAT_status (constant within subject)
+    subj_status <- tapply(
+      as.character(colData(se_filt)$BAT_status),
+      colData(se_filt)$subject_label,
+      function(x) names(which.max(table(x[!is.na(x)])))
+    )
+    pos_subjects <- names(subj_status[subj_status == "pos"])
+    neg_subjects <- names(subj_status[subj_status == "neg"])
+
+    cat("[STRAT] Active-BAT (pos) subjects (n=", length(pos_subjects), "): ",
+        paste(pos_subjects, collapse = ", "), "\n", sep = "")
+    cat("[STRAT] Inactive-BAT (neg) subjects (n=", length(neg_subjects), "): ",
+        paste(neg_subjects, collapse = ", "), "\n\n", sep = "")
+
+    ## ---- Active-BAT stratified model ----
+    ## Use the UNFILTERED SE and re-filter within this subgroup so we
+    ## don't lose genes that are only expressed in active-BAT tissue.
+    keep_active <- colData(se)$subject_label %in% pos_subjects
+    se_active <- se[, keep_active]
+    se_active$subject <- droplevels(se_active$subject)
+
+    ## Independent low-count filter for this subgroup
+    active_counts <- assay(se_active, "counts")
+    active_counts <- round(active_counts)
+    storage.mode(active_counts) <- "integer"
+    active_nonzero <- rowSums(active_counts > 0) > 0
+    active_counts_nz <- active_counts[active_nonzero, , drop = FALSE]
+    min_group_active <- min(table(se_active$tissue))
+    active_keep <- edgeR::filterByExpr(active_counts_nz, group = se_active$tissue,
+                                        min.count = max(MIN_COUNTS_PER_GENE,
+                                                        ceiling(median(colSums(active_counts)) / 1e6)))
+    se_active <- se_active[rownames(active_counts_nz)[active_keep], ]
+    assay(se_active, "counts") <- round(assay(se_active, "counts"))
+    storage.mode(assay(se_active, "counts")) <- "integer"
+
+    cat("[STRAT] Active-BAT subset: ", ncol(se_active), " samples from ",
+        nlevels(se_active$subject), " subjects\n", sep = "")
+    cat("[STRAT] Independent filter: ", nrow(se_active), " genes kept",
+        " (vs ", nrow(se_filt), " from global filter)\n", sep = "")
+
+    ## Check for genes rescued by independent filtering
+    rescued <- setdiff(rownames(se_active), rownames(se_filt))
+    if (length(rescued) > 0) {
+      cat("[STRAT] Rescued ", length(rescued),
+          " genes not in global filter (active-BAT specific)\n", sep = "")
+      ## Report if any key genes were rescued
+      key_rescued <- intersect(rescued, c("CLDN1", "UCP1", BAT_MARKER_GENES, "PPARG", "LEP"))
+      if (length(key_rescued) > 0) {
+        cat("[STRAT] Key genes rescued: ", paste(key_rescued, collapse = ", "), "\n", sep = "")
+      }
+    }
+
+    dds_active <- DESeqDataSet(se_active, design = ~ subject + tissue)
+    dds_active$tissue <- relevel(dds_active$tissue, ref = CONDITION_REF)
+    dds_active <- DESeq(dds_active, quiet = TRUE)
+    res_active <- results(dds_active,
+                           contrast = c("tissue", CONDITION_TEST, CONDITION_REF),
+                           alpha = PADJ_CUTOFF)
+    res_active_df <- as.data.frame(res_active) %>%
+      rownames_to_column("gene_id") %>%
+      arrange(padj)
+    res_active_df$symbol <- res_active_df$gene_id
+
+    n_up_bat_active <- sum(res_active_df$padj < PADJ_CUTOFF &
+                            res_active_df$log2FoldChange >= LFC_CUTOFF, na.rm = TRUE)
+    n_up_wat_active <- sum(res_active_df$padj < PADJ_CUTOFF &
+                            res_active_df$log2FoldChange <= -LFC_CUTOFF, na.rm = TRUE)
+    sanity$n_up_bat_active <- n_up_bat_active
+    sanity$n_up_wat_active <- n_up_wat_active
+
+    cat("[STRAT] Active-BAT DESeq2 complete: ", nrow(res_active_df), " genes\n", sep = "")
+    cat("        Up in BAT (padj<", PADJ_CUTOFF, ", LFC>=", LFC_CUTOFF, "): ",
+        n_up_bat_active, "\n", sep = "")
+    cat("        Up in WAT: ", n_up_wat_active, "\n", sep = "")
+
+    ## CLDN1 and UCP1 in active-BAT subjects
+    cldn1_active <- res_active_df[res_active_df$symbol == "CLDN1", ]
+    ucp1_active  <- res_active_df[res_active_df$symbol == "UCP1", ]
+
+    cat("\n##########################################################\n")
+    cat("##  CLDN1 in ACTIVE-BAT subjects (n=", length(pos_subjects),
+        ", PET-CT pos)  ##\n", sep = "")
+    cat("##########################################################\n\n")
+
+    if (nrow(cldn1_active) > 0) {
+      ca <- cldn1_active[1, ]
+      cat("  log2FC (BAT/WAT): ", round(ca$log2FoldChange, 3), "\n", sep = "")
+      cat("  p-value         : ", signif(ca$pvalue, 4), "\n", sep = "")
+      cat("  padj (BH)       : ", signif(ca$padj, 4), "\n", sep = "")
+      cat("  baseMean        : ", round(ca$baseMean, 1), "\n\n", sep = "")
+
+      if (!is.na(ca$padj) && ca$padj < PADJ_CUTOFF && ca$log2FoldChange > 0) {
+        cat("  >>> VERDICT (active-BAT): YES - CLDN1 SIGNIFICANTLY UP in active BAT\n")
+        if (ca$log2FoldChange >= LFC_CUTOFF) {
+          cat("      (meets both padj and log2FC thresholds)\n")
+        }
+        sanity$cldn1_active_verdict <- "UP_IN_BAT_SIGNIFICANT"
+      } else if (!is.na(ca$log2FoldChange) && ca$log2FoldChange > 0) {
+        cat("  >>> VERDICT (active-BAT): TREND - positive fold-change, not significant\n")
+        cat("      (padj = ", signif(ca$padj, 3), ")\n", sep = "")
+        sanity$cldn1_active_verdict <- "UP_TREND_NOT_SIGNIFICANT"
+      } else {
+        cat("  >>> VERDICT (active-BAT): NO - CLDN1 is LOWER in active BAT\n")
+        cat("      (log2FC = ", round(ca$log2FoldChange, 3), ")\n", sep = "")
+        sanity$cldn1_active_verdict <- "DOWN_IN_BAT"
+      }
+      sanity$cldn1_active_lfc  <- ca$log2FoldChange
+      sanity$cldn1_active_padj <- ca$padj
+    } else {
+      cat("  CLDN1 not found in active-BAT analysis\n")
+      sanity$cldn1_active_verdict <- "NOT_DETECTED"
+    }
+
+    cat("\n##########################################################\n")
+
+    ## UCP1 control in active-BAT
+    if (nrow(ucp1_active) > 0) {
+      ua <- ucp1_active[1, ]
+      cat("[STRAT] UCP1 in active-BAT: log2FC=", round(ua$log2FoldChange, 3),
+          " padj=", signif(ua$padj, 4), "\n", sep = "")
+      sanity$ucp1_active_lfc  <- ua$log2FoldChange
+      sanity$ucp1_active_padj <- ua$padj
+    }
+
+    ## ---- Inactive-BAT stratified model ----
+    if (length(neg_subjects) >= 3) {
+      keep_inactive <- colData(se)$subject_label %in% neg_subjects
+      se_inactive <- se[, keep_inactive]
+      se_inactive$subject <- droplevels(se_inactive$subject)
+
+      ## Independent low-count filter for inactive subgroup
+      inact_counts <- assay(se_inactive, "counts")
+      inact_counts <- round(inact_counts)
+      storage.mode(inact_counts) <- "integer"
+      inact_nonzero <- rowSums(inact_counts > 0) > 0
+      inact_counts_nz <- inact_counts[inact_nonzero, , drop = FALSE]
+      inact_keep <- edgeR::filterByExpr(inact_counts_nz, group = se_inactive$tissue,
+                                         min.count = max(MIN_COUNTS_PER_GENE,
+                                                         ceiling(median(colSums(inact_counts)) / 1e6)))
+      se_inactive <- se_inactive[rownames(inact_counts_nz)[inact_keep], ]
+      assay(se_inactive, "counts") <- round(assay(se_inactive, "counts"))
+      storage.mode(assay(se_inactive, "counts")) <- "integer"
+
+      cat("\n[STRAT] Inactive-BAT subset: ", ncol(se_inactive), " samples from ",
+          nlevels(se_inactive$subject), " subjects\n", sep = "")
+      cat("[STRAT] Independent filter: ", nrow(se_inactive), " genes kept\n", sep = "")
+
+      dds_inactive <- DESeqDataSet(se_inactive, design = ~ subject + tissue)
+      dds_inactive$tissue <- relevel(dds_inactive$tissue, ref = CONDITION_REF)
+      dds_inactive <- DESeq(dds_inactive, quiet = TRUE)
+      res_inactive <- results(dds_inactive,
+                               contrast = c("tissue", CONDITION_TEST, CONDITION_REF),
+                               alpha = PADJ_CUTOFF)
+      res_inactive_df <- as.data.frame(res_inactive) %>%
+        rownames_to_column("gene_id") %>%
+        arrange(padj)
+      res_inactive_df$symbol <- res_inactive_df$gene_id
+
+      cldn1_inactive <- res_inactive_df[res_inactive_df$symbol == "CLDN1", ]
+      ucp1_inactive  <- res_inactive_df[res_inactive_df$symbol == "UCP1", ]
+
+      n_up_bat_inactive <- sum(res_inactive_df$padj < PADJ_CUTOFF &
+                                res_inactive_df$log2FoldChange >= LFC_CUTOFF, na.rm = TRUE)
+      sanity$n_up_bat_inactive <- n_up_bat_inactive
+
+      cat("[STRAT] Inactive-BAT DEGs (padj<", PADJ_CUTOFF, ", |LFC|>=",
+          LFC_CUTOFF, "): ", n_up_bat_inactive, " up in BAT\n", sep = "")
+
+      if (nrow(cldn1_inactive) > 0) {
+        ci <- cldn1_inactive[1, ]
+        cat("[STRAT] CLDN1 in inactive-BAT: log2FC=", round(ci$log2FoldChange, 3),
+            " padj=", signif(ci$padj, 4), "\n", sep = "")
+        sanity$cldn1_inactive_lfc  <- ci$log2FoldChange
+        sanity$cldn1_inactive_padj <- ci$padj
+      }
+      if (nrow(ucp1_inactive) > 0) {
+        ui <- ucp1_inactive[1, ]
+        cat("[STRAT] UCP1 in inactive-BAT: log2FC=", round(ui$log2FoldChange, 3),
+            " padj=", signif(ui$padj, 4), "\n", sep = "")
+      }
+
+      ## Save inactive-BAT results
+      write.csv(res_inactive_df, file.path(outdir, "tables", "DE_BAT_vs_WAT_inactiveBAT.csv"),
+                row.names = FALSE)
+      verify_output_file(file.path(outdir, "tables", "DE_BAT_vs_WAT_inactiveBAT.csv"),
+                         "DE inactive-BAT CSV")
+    } else {
+      cat("[STRAT] Too few inactive-BAT subjects (", length(neg_subjects),
+          ") for stratified analysis\n", sep = "")
+    }
+
+    ## ---- 4.3d) Interaction model: tissue * BAT_status ----
+    cat("\n== 4.3d  Interaction model: tissue x BAT_status ==\n")
+    cat("[INTERACTION] Tests whether the BAT-vs-WAT fold change differs\n")
+    cat("              between PET-CT positive vs negative subjects.\n")
+    cat("              Design: ~ subject + tissue + tissue:BAT_status\n\n")
+
+    tryCatch({
+      dds_interact <- DESeqDataSet(se_filt,
+                                    design = ~ subject + tissue + tissue:BAT_status)
+      dds_interact$tissue     <- relevel(dds_interact$tissue, ref = CONDITION_REF)
+      dds_interact$BAT_status <- relevel(dds_interact$BAT_status, ref = "neg")
+      dds_interact <- DESeq(dds_interact, quiet = TRUE)
+
+      ## Find the interaction coefficient
+      coef_names <- resultsNames(dds_interact)
+      interact_coef <- grep("tissue.*BAT_status", coef_names, value = TRUE)
+      cat("[INTERACTION] Model coefficients: ", paste(coef_names, collapse = ", "), "\n", sep = "")
+
+      if (length(interact_coef) > 0) {
+        cat("[INTERACTION] Testing coefficient: ", interact_coef[1], "\n", sep = "")
+
+        res_interact <- results(dds_interact, name = interact_coef[1], alpha = PADJ_CUTOFF)
+        res_interact_df <- as.data.frame(res_interact) %>%
+          rownames_to_column("gene_id") %>%
+          arrange(padj)
+        res_interact_df$symbol <- res_interact_df$gene_id
+
+        cldn1_interact <- res_interact_df[res_interact_df$symbol == "CLDN1", ]
+        ucp1_interact  <- res_interact_df[res_interact_df$symbol == "UCP1", ]
+
+        if (nrow(cldn1_interact) > 0) {
+          cxi <- cldn1_interact[1, ]
+          cat("[INTERACTION] CLDN1 interaction (tissue:BAT_status):\n")
+          cat("              log2FC = ", round(cxi$log2FoldChange, 3),
+              " (positive = more up in active-BAT subjects)\n", sep = "")
+          cat("              padj = ", signif(cxi$padj, 4), "\n", sep = "")
+          if (!is.na(cxi$padj) && cxi$padj < PADJ_CUTOFF) {
+            cat("              >>> SIGNIFICANT: CLDN1 tissue effect differs by activation status\n")
+          } else {
+            cat("              >>> Not significant: CLDN1 tissue effect does not differ by status\n")
+          }
+          sanity$cldn1_interact_lfc  <- cxi$log2FoldChange
+          sanity$cldn1_interact_padj <- cxi$padj
+        }
+
+        if (nrow(ucp1_interact) > 0) {
+          uxi <- ucp1_interact[1, ]
+          cat("[INTERACTION] UCP1 interaction: log2FC=", round(uxi$log2FoldChange, 3),
+              " padj=", signif(uxi$padj, 4), "\n", sep = "")
+        }
+
+        n_interact_sig <- sum(res_interact_df$padj < PADJ_CUTOFF, na.rm = TRUE)
+        cat("[INTERACTION] Genes with significant tissue:BAT_status interaction (padj<",
+            PADJ_CUTOFF, "): ", n_interact_sig, "\n", sep = "")
+
+        ## Save interaction results
+        write.csv(res_interact_df,
+                  file.path(outdir, "tables", "DE_interaction_tissue_BATstatus.csv"),
+                  row.names = FALSE)
+        verify_output_file(file.path(outdir, "tables", "DE_interaction_tissue_BATstatus.csv"),
+                           "DE interaction CSV")
+      }
+    }, error = function(e) {
+      cat("[INTERACTION] Could not fit interaction model: ", conditionMessage(e), "\n", sep = "")
+      cat("[INTERACTION] This can occur with small sample sizes or rank-deficient designs.\n")
+    })
+
+    ## Save active-BAT results
+    write.csv(res_active_df, file.path(outdir, "tables", "DE_BAT_vs_WAT_activeBAT.csv"),
+              row.names = FALSE)
+    verify_output_file(file.path(outdir, "tables", "DE_BAT_vs_WAT_activeBAT.csv"),
+                       "DE active-BAT CSV")
+
+    ## Comparison table: CLDN1 across all models
+    cat("\n--- CLDN1 across all models ---\n")
+    cldn1_compare <- data.frame(
+      model = c("All subjects (paired)", "All subjects (unpaired)",
+                "Active-BAT only (paired)", "Inactive-BAT only (paired)"),
+      n_subjects = c(nlevels(se_filt$subject), nlevels(se_filt$subject),
+                     length(pos_subjects),
+                     if (exists("res_inactive_df")) length(neg_subjects) else NA),
+      log2FC = c(
+        if (nrow(cldn1_row) > 0) round(cldn1_row$log2FoldChange[1], 3) else NA,
+        {cu <- res_unpaired_df[res_unpaired_df$symbol == "CLDN1", ];
+         if (nrow(cu) > 0) round(cu$log2FoldChange[1], 3) else NA},
+        if (nrow(cldn1_active) > 0) round(cldn1_active$log2FoldChange[1], 3) else NA,
+        if (exists("cldn1_inactive") && nrow(cldn1_inactive) > 0)
+          round(cldn1_inactive$log2FoldChange[1], 3) else NA
+      ),
+      padj = c(
+        if (nrow(cldn1_row) > 0) signif(cldn1_row$padj[1], 4) else NA,
+        {cu <- res_unpaired_df[res_unpaired_df$symbol == "CLDN1", ];
+         if (nrow(cu) > 0) signif(cu$padj[1], 4) else NA},
+        if (nrow(cldn1_active) > 0) signif(cldn1_active$padj[1], 4) else NA,
+        if (exists("cldn1_inactive") && nrow(cldn1_inactive) > 0)
+          signif(cldn1_inactive$padj[1], 4) else NA
+      ),
+      stringsAsFactors = FALSE
+    )
+    print(cldn1_compare, row.names = FALSE)
+    write.csv(cldn1_compare, file.path(outdir, "tables", "CLDN1_model_comparison.csv"),
+              row.names = FALSE)
+    verify_output_file(file.path(outdir, "tables", "CLDN1_model_comparison.csv"),
+                       "CLDN1 model comparison")
+
+  } else {
+    cat("[STRAT] BAT_status not available in metadata; skipping stratified analysis.\n")
+    sanity$cldn1_active_verdict <- "STATUS_UNAVAILABLE"
+  }
 
   ## ---- 4.4) Gene symbol mapping --------------------------
   cat("\n== 4.4  Mapping gene IDs to symbols ==\n")
@@ -2153,6 +2601,47 @@ tryCatch({
       cat("[SKIP] CLDN1 not in VST matrix  cannot plot\n")
     }
 
+    ## -- 4.9c1b) CLDN1 boxplot stratified by BAT_status --
+    if (length(cldn1_id) > 0 && cldn1_id[1] %in% rownames(vst_mat) &&
+        "BAT_status" %in% colnames(colData(dds)) &&
+        sum(!is.na(colData(dds)$BAT_status)) > 0) {
+      cat("[PLOT] CLDN1 boxplot by BAT_status (active vs inactive)\n")
+
+      cldn1_vst_status <- data.frame(
+        expression = vst_mat[cldn1_id[1], ],
+        tissue     = colData(dds)$tissue,
+        subject    = colData(dds)$subject_label,
+        BAT_status = as.character(colData(dds)$BAT_status),
+        stringsAsFactors = FALSE
+      )
+      cldn1_vst_status$BAT_status_label <- ifelse(
+        cldn1_vst_status$BAT_status == "pos", "Active BAT (PET+)", "Inactive BAT (PET-)")
+
+      p_cldn1_status <- ggplot(cldn1_vst_status,
+                                aes(x = tissue, y = expression, fill = tissue)) +
+        geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
+        geom_line(aes(group = subject), colour = "grey50", linewidth = 0.4) +
+        geom_point(aes(colour = tissue), size = 3) +
+        geom_text(aes(label = subject), vjust = -0.6, size = 2.0) +
+        facet_wrap(~ BAT_status_label) +
+        scale_fill_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
+        scale_colour_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
+        labs(
+          title    = "CLDN1 Expression by BAT Activation Status",
+          subtitle = paste0("Active BAT (n=", sum(cldn1_vst_status$BAT_status == "pos") / 2,
+                            ") vs Inactive (n=", sum(cldn1_vst_status$BAT_status == "neg") / 2, ")"),
+          y = "VST-normalised expression", x = NULL
+        ) +
+        theme_bw(base_size = 13) +
+        theme(legend.position = "none", strip.text = element_text(face = "bold"))
+
+      cldn1_status_file <- paste0("CLDN1_boxplot_by_BATstatus_", run_tag, ".png")
+      ggsave(file.path(outdir, "plots", cldn1_status_file), plot = p_cldn1_status,
+             width = 8, height = 6, dpi = PLOT_DPI)
+      cat("[SAVED]", cldn1_status_file, "\n")
+      verify_output_file(file.path(outdir, "plots", cldn1_status_file), "CLDN1 BAT_status plot")
+    }
+
     ## -- 4.9c2) UCP1 expression box plot (positive control) --
     cat("[PLOT] UCP1 per-sample boxplot\n")
 
@@ -2357,6 +2846,13 @@ tryCatch({
     cldn1_verdict = sanity$cldn1_verdict,
     cldn1_ucp1_rho = ifelse(!is.null(sanity$cldn1_ucp1_rho),
                              round(sanity$cldn1_ucp1_rho, 4), NA),
+    n_up_bat_active = ifelse(!is.null(sanity$n_up_bat_active), sanity$n_up_bat_active, NA),
+    cldn1_active_lfc     = ifelse(!is.null(sanity$cldn1_active_lfc),
+                                   round(sanity$cldn1_active_lfc, 4), NA),
+    cldn1_active_padj    = ifelse(!is.null(sanity$cldn1_active_padj),
+                                   signif(sanity$cldn1_active_padj, 4), NA),
+    cldn1_active_verdict = ifelse(!is.null(sanity$cldn1_active_verdict),
+                                   sanity$cldn1_active_verdict, NA),
     stringsAsFactors = FALSE
   )
 
@@ -2385,14 +2881,17 @@ tryCatch({
       "UCP1 log2FC",
       "UCP1 padj",
       "CLDN1 found",
-      "CLDN1 verdict",
+      "CLDN1 verdict (all subjects)",
+      "CLDN1 verdict (active-BAT only)",
+      "CLDN1 active-BAT log2FC",
+      "CLDN1 active-BAT padj",
       "CLDN1 vs UCP1 rho (BAT)"
     ),
     expected = c(
       N_SAMPLES_EXPECTED,
       N_SUBJECTS,
       "1 (raw counts) or >1 (scaled)",
-      "~217000 (GEO file)",
+      "~37000-40000 (NCBI counts)",
       "15000-25000",
       "FALSE (ideally)",
       "< 10",
@@ -2403,6 +2902,9 @@ tryCatch({
       "< 0.05",
       "TRUE",
       "user-defined",
+      "user-defined (cold-exposed)",
+      "> 0 if CLDN1 up in active BAT",
+      "< 0.05 if significant",
       "positive"
     ),
     observed = c(
@@ -2420,6 +2922,9 @@ tryCatch({
       ifelse(isTRUE(sanity$ucp1_found), signif(sanity$ucp1_padj, 4), "NOT_FOUND"),
       sanity$cldn1_found,
       sanity$cldn1_verdict,
+      ifelse(!is.null(sanity$cldn1_active_verdict), sanity$cldn1_active_verdict, "N/A"),
+      ifelse(!is.null(sanity$cldn1_active_lfc), round(sanity$cldn1_active_lfc, 3), "N/A"),
+      ifelse(!is.null(sanity$cldn1_active_padj), signif(sanity$cldn1_active_padj, 4), "N/A"),
       ifelse(!is.null(sanity$cldn1_ucp1_rho),
              round(sanity$cldn1_ucp1_rho, 3), "NA")
     ),
@@ -2520,6 +3025,9 @@ cat("##  DONE  Part 1 complete                              ##\n")
 cat("##  Run directory: ", basename(outdir), "\n", sep = "")
 cat("##  UCP1  verdict: ", ifelse(is.null(sanity$ucp1_verdict), "NA",
                                    sanity$ucp1_verdict), "\n", sep = "")
-cat("##  CLDN1 verdict: ", sanity$cldn1_verdict, "\n", sep = "")
+cat("##  CLDN1 verdict (all): ", sanity$cldn1_verdict, "\n", sep = "")
+cat("##  CLDN1 verdict (active-BAT): ",
+    ifelse(!is.null(sanity$cldn1_active_verdict), sanity$cldn1_active_verdict, "N/A"),
+    "\n", sep = "")
 cat("##########################################################\n")
 cat("End time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")

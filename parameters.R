@@ -119,6 +119,6 @@ SAVECORE_MODE      <- "new"      # new | resume_latest | resume_tag
 SAVECORE_RUN_TAG   <- NULL       # used only when SAVECORE_MODE == "resume_tag"
 
 ## ---- Optional local counts override ----------------------
-LOCAL_COUNTS_PATH  <- NULL       # e.g. "GSE113764_raw_counts_GRCh38.p13_NCBI.tsv.gz"
+LOCAL_COUNTS_PATH  <- NULL       # e.g. "GSE113764_raw_counts_GRCh38.p13_NCBI"
 
 cat("[OK] parameters.R loaded for", STUDY_TITLE, "\n")

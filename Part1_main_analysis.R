@@ -107,7 +107,7 @@ download_ncbi_counts <- function(geo_accession, dest_dir) {
   ## These are standardised count tables produced by NCBI's pipeline,
 
   ## separate from the author-submitted supplementary files.
-  fname <- paste0(geo_accession, "_raw_counts_GRCh38.p13_NCBI.tsv.gz")
+  fname <- paste0(geo_accession, "_raw_counts_GRCh38.p13_NCBI")
   dest  <- file.path(dest_dir, fname)
   if (file.exists(dest)) {
     cat("[INFO] NCBI counts file already downloaded:", basename(dest), "\n")
@@ -269,12 +269,21 @@ find_local_count_file <- function(geo_accession, workdir) {
     warning("[WARN] LOCAL_COUNTS_PATH was set but not found: ", LOCAL_COUNTS_PATH)
   }
 
+  ## Match NCBI counts file (with or without extension) and other common patterns
   candidates <- list.files(
     workdir,
-    pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv|tsv)(\\.gz)?$"),
+    pattern = paste0("^", geo_accession, ".*raw_counts_GRCh38.*NCBI"),
     full.names = TRUE,
     ignore.case = TRUE
   )
+  if (length(candidates) == 0) {
+    candidates <- list.files(
+      workdir,
+      pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv|tsv)(\\.gz)?$"),
+      full.names = TRUE,
+      ignore.case = TRUE
+    )
+  }
 
   if (length(candidates) > 0) {
     cat("[INFO] Found local count file candidate:", basename(candidates[1]), "\n")
@@ -512,7 +521,7 @@ tryCatch({
     gse <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, getGPL = FALSE)
     gse <- gse[[1]]
 
-    ## Try local counts first; then NCBI-generated counts; finally GEO supp files
+    ## Try local counts first; then download NCBI-generated counts
     supp_dir <- file.path(cache_dir, "geo_supp")
     dir.create(supp_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -532,7 +541,7 @@ tryCatch({
         is_ncbi_counts <- TRUE
       } else {
         stop("Could not download NCBI-generated counts file for ", GEO_ACCESSION,
-             ". Download GSE113764_raw_counts_GRCh38.p13_NCBI.tsv.gz manually from\n",
+             ". Download GSE113764_raw_counts_GRCh38.p13_NCBI manually from\n",
              "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE113764\n",
              "and place it in the working directory, or set LOCAL_COUNTS_PATH.")
       }
@@ -548,6 +557,70 @@ tryCatch({
       if (ncol(counts_raw) < 2) {
         stop("Count file appears malformed (fewer than 2 columns): ", count_file,
              ". If this is a gzipped file without .gz extension, recompress/rename or set LOCAL_COUNTS_PATH correctly.")
+      }
+
+      ## ---- NCBI counts sanity gate ----
+      ## Verify the file looks like NCBI-generated counts before proceeding
+      if (is_ncbi_counts) {
+        cn_raw <- colnames(counts_raw)
+        cat("\n--- NCBI COUNTS INTAKE CHECK ---\n")
+        cat("[NCBI-CHK] File: ", basename(count_file), "\n", sep = "")
+        cat("[NCBI-CHK] Dimensions: ", nrow(counts_raw), " rows x ",
+            ncol(counts_raw), " cols\n", sep = "")
+        cat("[NCBI-CHK] Column names: ", paste(head(cn_raw, 15), collapse = ", "),
+            if (length(cn_raw) > 15) " ..." else "", "\n", sep = "")
+
+        ## Check col1 contains numeric Entrez IDs
+        col1_vals <- head(as.character(counts_raw[[1]]), 20)
+        n_numeric_ids <- sum(grepl("^[0-9]+$", col1_vals))
+        cat("[NCBI-CHK] Col1 sample values: ", paste(head(col1_vals, 8), collapse = ", "), "\n", sep = "")
+        cat("[NCBI-CHK] Col1 numeric (Entrez-like): ", n_numeric_ids, "/",
+            length(col1_vals), "\n", sep = "")
+        if (n_numeric_ids < length(col1_vals) * 0.8) {
+          stop("[NCBI-CHK] FAIL: Column 1 does not contain Entrez Gene IDs. ",
+               "This does not look like an NCBI-generated counts file. ",
+               "Check that you downloaded the correct file from GEO.")
+        }
+
+        ## Check remaining columns are GSM sample IDs
+        sample_cols <- cn_raw[-1]
+        n_gsm <- sum(grepl("^GSM[0-9]+", sample_cols))
+        cat("[NCBI-CHK] Sample columns matching GSM pattern: ", n_gsm, "/",
+            length(sample_cols), "\n", sep = "")
+        if (n_gsm == 0 && length(sample_cols) > 0) {
+          cat("[NCBI-CHK] WARNING: No GSM-prefixed columns found. ",
+              "Column names: ", paste(head(sample_cols, 5), collapse = ", "), "\n", sep = "")
+        }
+
+        ## Check expected row count range (human genome ~20K-60K Entrez IDs)
+        if (nrow(counts_raw) < 5000) {
+          cat("[NCBI-CHK] WARNING: Only ", nrow(counts_raw),
+              " rows — expected 20K-60K for human genome.\n", sep = "")
+        } else if (nrow(counts_raw) >= 15000 && nrow(counts_raw) <= 65000) {
+          cat("[NCBI-CHK] OK: Row count (", nrow(counts_raw),
+              ") in expected range for human Entrez IDs.\n", sep = "")
+        }
+
+        ## Spot-check: values should be integer-like raw counts
+        test_vals <- as.numeric(unlist(counts_raw[1:min(100, nrow(counts_raw)), -1, drop = FALSE]))
+        test_vals <- test_vals[!is.na(test_vals)]
+        if (length(test_vals) > 0) {
+          frac_integer <- mean(test_vals == floor(test_vals))
+          cat("[NCBI-CHK] Fraction of integer values (first 100 rows): ",
+              round(frac_integer * 100, 1), "%\n", sep = "")
+          if (frac_integer < 0.95) {
+            cat("[NCBI-CHK] WARNING: Values are not all integers — ",
+                "may not be raw counts.\n", sep = "")
+          }
+          cat("[NCBI-CHK] Value range (first 100 rows): ",
+              format(min(test_vals), big.mark = ","), " - ",
+              format(max(test_vals), big.mark = ","), "\n", sep = "")
+          if (max(test_vals) > 1e7) {
+            cat("[NCBI-CHK] WARNING: Max value > 10M in first 100 rows — ",
+                "may be pre-scaled, not raw counts.\n", sep = "")
+          }
+        }
+        cat("--- END NCBI COUNTS INTAKE CHECK ---\n\n")
       }
 
       ## ---- Gene-ID extraction ----
@@ -712,11 +785,6 @@ tryCatch({
         }
       }
       cat("--- END SANITY BLOCK A ---\n\n")
-
-    } else {
-      ## Fallback: use exprs() from the GEO Series Matrix
-      cat("[INFO] No count file found; using Series Matrix expression data\n")
-      counts_raw <- as.data.frame(exprs(gse))
     }
 
     ## Build sample metadata from GEO phenoData

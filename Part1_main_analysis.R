@@ -1,14 +1,14 @@
 ## =========================================================
-## Part 1 — Main Analysis: Virtanen Human BAT RNA-seq
+## Part 1  Main Analysis: Virtanen Human BAT RNA-seq
 ## =========================================================
 ## Goal : Determine whether CLDN1 is increased in human BAT
 ##        relative to paired subcutaneous WAT
 ## Data : GSE113764 (Virtanen et al. Cell Metabolism 2018)
-## Design: Paired — 14 subjects × 2 tissues (BAT / WAT)
+## Design: Paired  14 subjects  2 tissues (BAT / WAT)
 ## Model : ~ subject + tissue  (paired DESeq2)
 ## =========================================================
 
-cat("=== Part 1: Virtanen Human BAT — CLDN1 validation ===\n")
+cat("=== Part 1: Virtanen Human BAT  CLDN1 validation ===\n")
 cat("Start time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
 
 
@@ -128,8 +128,8 @@ print_run_structure_sanity <- function(outdir) {
 normalize_sample_id <- function(x) {
   x <- as.character(x)
   x <- tolower(x)
-  ## Transliterate accented characters to ASCII (ä→a, ö→o, etc.)
-  ## before stripping, so Finnish names like "Päoi" match correctly.
+  ## Transliterate accented characters to ASCII (a, o, etc.)
+  ## before stripping, so Finnish names like "Poi" match correctly.
   x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
   gsub("[^a-z0-9]", "", x)
 }
@@ -316,14 +316,14 @@ set.seed(SEED)
 sanity <- list()
 
 ## ==========================================================
-## 4) MAIN ANALYSIS — wrapped in tryCatch
+## 4) MAIN ANALYSIS  wrapped in tryCatch
 ## ==========================================================
 tryCatch({
 
   ## ---- 4.1) Download / load GEO data ---------------------
   cat("== 4.1  Fetching GEO data:", GEO_ACCESSION, "==\n")
 
-  ## Clean slate — prevent stale objects from a previous run in the same
+  ## Clean slate  prevent stale objects from a previous run in the same
   ## R session from silently skipping the rebuild.
   if (exists("se", inherits = FALSE))  rm(se)
   if (exists("dds", inherits = FALSE)) rm(dds)
@@ -425,7 +425,7 @@ tryCatch({
                               cn, ignore.case = TRUE)
 
       if (length(symbol_col_idx) > 0) {
-        ## Found a Symbol column — use it as the gene identifier
+        ## Found a Symbol column  use it as the gene identifier
         sym_idx <- symbol_col_idx[1]
         gene_col <- as.character(counts_raw[[sym_idx]])
         cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
@@ -438,7 +438,7 @@ tryCatch({
         cat("[INFO] Dropping identifier columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
         counts_raw <- counts_raw[, -cols_to_drop, drop = FALSE]
       } else {
-        ## No Symbol column — fall back to col1 as gene identifier
+        ## No Symbol column  fall back to col1 as gene identifier
         gene_col <- as.character(counts_raw[[1]])
         counts_raw <- counts_raw[, -1, drop = FALSE]
         cat("[INFO] No 'Symbol' column found; using column 1 as gene identifier\n")
@@ -499,14 +499,14 @@ tryCatch({
       ## If lib sizes are >1 billion, data may be transcript-level or pre-scaled.
       if (median(lib_sizes_raw) > 1e9) {
         cat("[A1] WARNING: Median library size is ", format(median(lib_sizes_raw), big.mark = ","),
-            " — this is FAR above typical RNA-seq (10M-200M).\n", sep = "")
+            "  this is FAR above typical RNA-seq (10M-200M).\n", sep = "")
         cat("     Possible causes:\n")
         cat("     - Data is at transcript level (needs gene-level aggregation)\n")
         cat("     - Genomatix weighted counts (not raw read counts)\n")
         cat("     - Pre-scaled or multiplied values\n")
         cat("     DESeq2 may still work, but interpret size factors carefully.\n")
       } else if (median(lib_sizes_raw) >= 1e6 && median(lib_sizes_raw) <= 5e8) {
-        cat("[A1] OK — library sizes in typical RNA-seq range\n")
+        cat("[A1] OK  library sizes in typical RNA-seq range\n")
       }
 
       ## A2. Gene ID classification
@@ -569,7 +569,7 @@ tryCatch({
       for (kg in key_genes) {
         idx <- which(gene_ids == kg)
         if (length(idx) > 0) {
-          cat("[A5] ", kg, " present — row sum = ",
+          cat("[A5] ", kg, " present  row sum = ",
               format(row_sums[idx[1]], big.mark = ","),
               ", mean = ", round(mean(as.numeric(counts_raw[idx[1], ])), 1), "\n", sep = "")
         } else {
@@ -652,7 +652,7 @@ tryCatch({
           length(counts_norm), "count columns matched\n")
     }
 
-    ## Step 3: order-based fallback (last resort) — only if dimensions agree
+    ## Step 3: order-based fallback (last resort)  only if dimensions agree
     if (sum(matched) < 2) {
       cat("[WARN] Weak sample-name matching; attempting order-based fallback\n")
       if (ncol(counts_raw) != nrow(pdata)) {
@@ -782,7 +782,7 @@ tryCatch({
     cat("            Possible CPM or log-transformed data.\n")
     sanity$data_type_warning <- "UNUSUALLY_LOW"
   } else {
-    cat("[RAW-CHECK] OK — data looks like raw integer counts\n")
+    cat("[RAW-CHECK] OK  data looks like raw integer counts\n")
     sanity$data_type_warning <- "NONE"
   }
 
@@ -798,7 +798,7 @@ tryCatch({
     cat("[PAIRED] WARNING: ", length(unpaired), " subject(s) lack one tissue:\n", sep = "")
     for (u in unpaired) {
       present <- colnames(subj_tissue)[subj_tissue[u, ] > 0]
-      cat("         ", u, " — only has: ", paste(present, collapse = ", "), "\n", sep = "")
+      cat("         ", u, "  only has: ", paste(present, collapse = ", "), "\n", sep = "")
     }
     cat("[PAIRED] Removing unpaired subjects to avoid DESeq2 model errors\n")
     keep_paired <- !(se$subject %in% unpaired)
@@ -807,7 +807,7 @@ tryCatch({
     cat("[PAIRED] Remaining: ", ncol(se), " samples from ",
         nlevels(se$subject), " complete pairs\n", sep = "")
   } else {
-    cat("[PAIRED] OK — all ", nlevels(se$subject),
+    cat("[PAIRED] OK  all ", nlevels(se$subject),
         " subjects have both ", CONDITION_REF, " and ", CONDITION_TEST, "\n", sep = "")
   }
 
@@ -846,7 +846,7 @@ tryCatch({
   ## ---- 4.2) Pre-filtering --------------------------------
   ## Standard approach (Nature/Cell Metabolism convention):
   ##   Keep genes with CPM >= 1 in at least the smallest group size.
-  ## This is purely count-driven — no gene-ID pattern matching needed.
+  ## This is purely count-driven  no gene-ID pattern matching needed.
   ## Non-coding junk (GenBank accessions etc.) naturally drops out
   ## because those features have zero/near-zero counts.
   ##
@@ -915,7 +915,7 @@ tryCatch({
   n_overflow <- sum(counts_mat > int_max)
   if (n_overflow > 0) {
     cat("[SANITY] WARNING: ", n_overflow,
-        " values still exceed integer max after scaling — capping\n", sep = "")
+        " values still exceed integer max after scaling  capping\n", sep = "")
     counts_mat[counts_mat > int_max] <- int_max
   }
 
@@ -932,7 +932,7 @@ tryCatch({
     cat("[FILTER] Smallest group size:", min_group, "samples\n")
     cat("[FILTER] Median library size:", format(med_lib, big.mark = ","), "\n")
 
-    ## Step 1: fast pre-screen — remove genes with zero counts in ALL samples.
+    ## Step 1: fast pre-screen  remove genes with zero counts in ALL samples.
     ##         This is instant and eliminates the bulk of ~217K features.
     nonzero <- rowSums(counts_mat > 0) > 0
     n_allzero <- sum(!nonzero)
@@ -984,7 +984,7 @@ tryCatch({
   ## B1. Dimension check
   cat("[B1] Filtered matrix: ", nrow(se_filt), " genes x ", ncol(se_filt), " samples\n", sep = "")
 
-  ## B2. Hard cap — if still >30K genes, something is wrong; do a second-pass
+  ## B2. Hard cap  if still >30K genes, something is wrong; do a second-pass
   MAX_GENES_FOR_DESEQ <- 30000
   if (nrow(se_filt) > MAX_GENES_FOR_DESEQ) {
     cat("[B2] WARNING: ", nrow(se_filt), " genes exceeds hard cap of ",
@@ -1030,7 +1030,7 @@ tryCatch({
 
   cat("--- END SANITY BLOCK B ---\n\n")
 
-  ## ---- 4.3) DESeq2 — paired design ----------------------
+  ## ---- 4.3) DESeq2  paired design ----------------------
   cat("\n== 4.3  DESeq2 paired analysis ==\n")
 
   ## Sanity block C: Pre-DESeq2 diagnostics
@@ -1052,14 +1052,19 @@ tryCatch({
   mem_est_mb <- (8 * n_genes_for_deseq * n_samples_for_deseq * 6) / (1024^2)
   cat("[C2] Estimated DESeq2 memory: ~", round(mem_est_mb, 0), " MB for core matrices\n", sep = "")
   avail_mem <- tryCatch({
-    if (!file.exists("/proc/meminfo")) return(NA_real_)
-    meminfo <- suppressWarnings(readLines("/proc/meminfo", n = 3))
-    avail_line <- grep("MemAvailable", meminfo, value = TRUE)
-    if (length(avail_line) > 0) {
-      avail_kb <- as.numeric(gsub("[^0-9]", "", avail_line))
-      round(avail_kb / 1024)
-    } else NA
-  }, error = function(e) NA)
+    if (!file.exists("/proc/meminfo")) {
+      NA_real_
+    } else {
+      meminfo <- suppressWarnings(readLines("/proc/meminfo", n = 3))
+      avail_line <- grep("MemAvailable", meminfo, value = TRUE)
+      if (length(avail_line) > 0) {
+        avail_kb <- as.numeric(gsub("[^0-9]", "", avail_line))
+        round(avail_kb / 1024)
+      } else {
+        NA_real_
+      }
+    }
+  }, error = function(e) NA_real_)
   if (!is.na(avail_mem)) {
     cat("[C2] Available system memory: ~", avail_mem, " MB\n", sep = "")
     if (mem_est_mb > avail_mem * 0.5) {
@@ -1098,7 +1103,7 @@ tryCatch({
         vst_cache_path <- file.path(cache_dir, "vst_counts.rds")
         if (file.exists(vst_cache_path)) file.remove(vst_cache_path)
       } else {
-        cat("[C4] Cache gene count matches (", cached_ngenes, ") — using cache\n", sep = "")
+        cat("[C4] Cache gene count matches (", cached_ngenes, ")  using cache\n", sep = "")
       }
       rm(cached_dds)
     }
@@ -1115,7 +1120,7 @@ tryCatch({
   ## ---- Sanity block D: Post-DESeq2 model diagnostics ----
   cat("\n--- SANITY BLOCK D: DESeq2 model diagnostics ---\n")
 
-  ## D1. Size factors — should be ~0.5-2.0 for most samples.
+  ## D1. Size factors  should be ~0.5-2.0 for most samples.
   ##     Extreme values indicate library-size or composition problems.
   sf <- sizeFactors(dds)
   cat("[D1] Size factors:\n")
@@ -1126,11 +1131,11 @@ tryCatch({
     cat("[D1] WARNING: Extreme size factors in:", paste(sf_outliers, collapse = ", "), "\n")
     cat("     This may indicate failed library prep or contamination.\n")
   } else {
-    cat("[D1] OK — all size factors within normal range (0.1-10)\n")
+    cat("[D1] OK  all size factors within normal range (0.1-10)\n")
   }
   sanity$size_factor_range <- paste0(round(min(sf), 3), "-", round(max(sf), 3))
 
-  ## D2. Dispersion estimates — check for unusual patterns.
+  ## D2. Dispersion estimates  check for unusual patterns.
   ##     Median dispersion for human RNA-seq is typically 0.01-0.3.
   dispersions <- mcols(dds)$dispGeneEst
   dispersions <- dispersions[!is.na(dispersions)]
@@ -1145,20 +1150,20 @@ tryCatch({
     if (median(dispersions) > 1) {
       cat("[D2] WARNING: High median dispersion suggests noisy data or poor model fit.\n")
     } else {
-      cat("[D2] OK — dispersion range typical for human tissue RNA-seq\n")
+      cat("[D2] OK  dispersion range typical for human tissue RNA-seq\n")
     }
   }
 
-  ## D3. Convergence — check for genes where DESeq2 maxed out iterations.
+  ## D3. Convergence  check for genes where DESeq2 maxed out iterations.
   n_not_converged <- sum(mcols(dds)$betaConv == FALSE, na.rm = TRUE)
   cat("[D3] Genes that did not converge:", n_not_converged, "of", nrow(dds), "\n")
   if (n_not_converged > nrow(dds) * 0.05) {
     cat("[D3] WARNING: >5% non-convergence. Model may be mis-specified.\n")
   } else {
-    cat("[D3] OK — convergence rate normal\n")
+    cat("[D3] OK  convergence rate normal\n")
   }
 
-  ## D4. Cook's distance — flag outlier samples that dominate results.
+  ## D4. Cook's distance  flag outlier samples that dominate results.
   ##     High Cook's for many genes in one sample = probable outlier.
   cooks_mat <- assays(dds)[["cooks"]]
   if (!is.null(cooks_mat)) {
@@ -1181,7 +1186,7 @@ tryCatch({
           paste(high_cooks, collapse = ", "), "\n", sep = "")
       cat("     Consider removing these outliers and re-running.\n")
     } else {
-      cat("[D4] OK — no sample-level outliers by Cook's distance\n")
+      cat("[D4] OK  no sample-level outliers by Cook's distance\n")
     }
   }
 
@@ -1245,7 +1250,7 @@ tryCatch({
     cat("     Possible batch effects, misspecified model, or violated assumptions.\n")
     sanity$pval_distribution <- "ANTI_CONSERVATIVE"
   } else {
-    cat("[E3] OK — p-value distribution looks healthy (spike near 0, flat elsewhere)\n")
+    cat("[E3] OK  p-value distribution looks healthy (spike near 0, flat elsewhere)\n")
     sanity$pval_distribution <- "HEALTHY"
   }
 
@@ -1327,7 +1332,7 @@ tryCatch({
 
   cat("[OK] Mapped", n_mapped, "of", nrow(res_df), "genes to HGNC symbols\n")
 
-  ## ---- 4.5) CLDN1 — the primary question -----------------
+  ## ---- 4.5) CLDN1  the primary question -----------------
   cat("\n")
   cat("##########################################################\n")
   cat("##  PRIMARY QUERY: Is CLDN1 increased in human BAT?     ##\n")
@@ -1357,7 +1362,7 @@ tryCatch({
 
     if (!is.na(cldn1$padj) && cldn1$padj < PADJ_CUTOFF &&
         cldn1$log2FoldChange > 0) {
-      cat("  >>> VERDICT: YES — CLDN1 is SIGNIFICANTLY INCREASED in BAT\n")
+      cat("  >>> VERDICT: YES  CLDN1 is SIGNIFICANTLY INCREASED in BAT\n")
       if (cldn1$log2FoldChange >= LFC_CUTOFF) {
         cat("      (meets both padj and log2FC thresholds)\n")
       } else {
@@ -1365,12 +1370,12 @@ tryCatch({
       }
       sanity$cldn1_verdict <- "UP_IN_BAT_SIGNIFICANT"
     } else if (!is.na(cldn1$log2FoldChange) && cldn1$log2FoldChange > 0) {
-      cat("  >>> VERDICT: TREND — CLDN1 shows a positive fold-change in BAT\n")
+      cat("  >>> VERDICT: TREND  CLDN1 shows a positive fold-change in BAT\n")
       cat("      but does NOT reach statistical significance (padj =",
           signif(cldn1$padj, 3), ")\n")
       sanity$cldn1_verdict <- "UP_TREND_NOT_SIGNIFICANT"
     } else if (!is.na(cldn1$log2FoldChange) && cldn1$log2FoldChange < 0) {
-      cat("  >>> VERDICT: NO — CLDN1 is LOWER in BAT than WAT\n")
+      cat("  >>> VERDICT: NO  CLDN1 is LOWER in BAT than WAT\n")
       cat("      (log2FC =", round(cldn1$log2FoldChange, 3), ")\n")
       sanity$cldn1_verdict <- "DOWN_IN_BAT"
     } else {
@@ -1398,7 +1403,7 @@ tryCatch({
     }
   }
 
-  ## ---- 4.5b) UCP1 — positive control ----------------------
+  ## ---- 4.5b) UCP1  positive control ----------------------
   cat("\n")
   cat("##########################################################\n")
   cat("##  CONTROL: UCP1 expression (canonical BAT marker)     ##\n")
@@ -1407,7 +1412,7 @@ tryCatch({
   ucp1_row <- res_df[res_df$symbol == "UCP1", ]
 
   if (nrow(ucp1_row) == 0) {
-    cat("[!!] UCP1 NOT FOUND — this is unexpected for BAT/WAT data\n")
+    cat("[!!] UCP1 NOT FOUND  this is unexpected for BAT/WAT data\n")
     sanity$ucp1_found   <- FALSE
     sanity$ucp1_verdict <- "NOT_DETECTED"
   } else {
@@ -1437,7 +1442,7 @@ tryCatch({
       cat("  >>> CONTROL WARNING: UCP1 trends up but is not significant\n")
       sanity$ucp1_verdict <- "UP_TREND_NOT_SIGNIFICANT"
     } else {
-      cat("  >>> CONTROL WARNING: UCP1 not up in BAT — check data integrity\n")
+      cat("  >>> CONTROL WARNING: UCP1 not up in BAT  check data integrity\n")
       sanity$ucp1_verdict <- "UNEXPECTED"
     }
   }
@@ -1510,7 +1515,7 @@ tryCatch({
   ## ---- Sanity block F: Sample-level QC (on VST data) ----
   cat("\n--- SANITY BLOCK F: Sample-level QC ---\n")
 
-  ## F1. Inter-sample Spearman correlation — should be high (>0.8)
+  ## F1. Inter-sample Spearman correlation  should be high (>0.8)
   ##     within tissue, lower between tissues.
   if (ncol(vst_mat) <= 100) {  # skip for very large designs
     cor_mat <- cor(vst_mat, method = "spearman")
@@ -1528,7 +1533,7 @@ tryCatch({
         if (min(within_cors, na.rm = TRUE) < 0.8) {
           low_pairs <- which(cor_mat[idx, idx] < 0.8 & upper.tri(cor_mat[idx, idx]), arr.ind = TRUE)
           cat("[F1] WARNING: Low within-group correlation in ", tis,
-              " — possible outlier sample(s)\n", sep = "")
+              "  possible outlier sample(s)\n", sep = "")
         }
       }
     }
@@ -1544,7 +1549,7 @@ tryCatch({
     }
   }
 
-  ## F2. PCA variance — PC1 should capture tissue effect.
+  ## F2. PCA variance  PC1 should capture tissue effect.
   ##     If PC1 variance is <10%, the tissue signal may be weak.
   pca_obj <- prcomp(t(vst_mat), center = TRUE, scale. = FALSE)
   pct_var <- round(100 * (pca_obj$sdev^2 / sum(pca_obj$sdev^2)), 1)
@@ -1564,7 +1569,7 @@ tryCatch({
         cat("[F2] WARNING: PC1 does NOT significantly separate tissues.\n")
         cat("     Tissue effect may be weak or confounded by batch/subject effects.\n")
       } else {
-        cat("[F2] OK — PC1 clearly separates BAT from WAT\n")
+        cat("[F2] OK  PC1 clearly separates BAT from WAT\n")
       }
     }
   }
@@ -1801,7 +1806,7 @@ tryCatch({
       cat("[SAVED]", cldn1_plot_file, "\n")
       verify_output_file(file.path(outdir, "plots", cldn1_plot_file), "CLDN1 boxplot")
     } else {
-      cat("[SKIP] CLDN1 not in VST matrix — cannot plot\n")
+      cat("[SKIP] CLDN1 not in VST matrix  cannot plot\n")
     }
 
     ## -- 4.9c2) UCP1 expression box plot (positive control) --
@@ -1835,7 +1840,7 @@ tryCatch({
       cat("[SAVED]", ucp1_plot_file, "\n")
       verify_output_file(file.path(outdir, "plots", ucp1_plot_file), "UCP1 boxplot")
     } else {
-      cat("[SKIP] UCP1 not in VST matrix — cannot plot\n")
+      cat("[SKIP] UCP1 not in VST matrix  cannot plot\n")
     }
 
     ## -- 4.9c3) Correlation: CLDN1 vs UCP1 in BAT samples --
@@ -1883,7 +1888,7 @@ tryCatch({
       cat("[SAVED]", cor_file, "\n")
       verify_output_file(file.path(outdir, "plots", cor_file), "Correlation plot")
     } else {
-      cat("[SKIP] CLDN1 or UCP1 not found — cannot compute correlation\n")
+      cat("[SKIP] CLDN1 or UCP1 not found  cannot compute correlation\n")
     }
 
     ## -- 4.9d) Heatmap of top DEGs with CLDN1 marked ------
@@ -2166,7 +2171,7 @@ if (length(plots_written) > 0) {
 
 cat("\n")
 cat("##########################################################\n")
-cat("##  DONE — Part 1 complete                              ##\n")
+cat("##  DONE  Part 1 complete                              ##\n")
 cat("##  Run directory: ", basename(outdir), "\n", sep = "")
 cat("##  UCP1  verdict: ", ifelse(is.null(sanity$ucp1_verdict), "NA",
                                    sanity$ucp1_verdict), "\n", sep = "")

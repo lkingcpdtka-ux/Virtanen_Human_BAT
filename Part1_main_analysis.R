@@ -427,28 +427,13 @@ tryCatch({
         gene_col <- as.character(counts_raw[[sym_idx]])
         cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
 
-        ## Identify non-count annotation columns to drop
-        ## Keep only columns that look like sample data (numeric)
-        first_col <- counts_raw[[1]]
-        annotation_cols <- c(1, sym_idx)  # always drop col1 + symbol col
-
-        ## Also drop other annotation columns (GeneId, Description, etc.)
-        for (ci in seq_len(ncol(counts_raw))) {
-          if (ci %in% annotation_cols) next
-          col_vals <- as.character(counts_raw[[ci]])
-          ## If >50% of values fail numeric conversion, it's annotation
-          numeric_frac <- mean(!is.na(suppressWarnings(as.numeric(col_vals))), na.rm = TRUE)
-          if (numeric_frac < 0.5) {
-            annotation_cols <- c(annotation_cols, ci)
-          }
-        }
-
-        annotation_cols <- sort(unique(annotation_cols))
-        if (length(annotation_cols) > 0) {
-          dropped_names <- cn[annotation_cols]
-          cat("[INFO] Dropping annotation columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
-          counts_raw <- counts_raw[, -annotation_cols, drop = FALSE]
-        }
+        ## Drop the first column (accession) and the Symbol column.
+        ## All remaining column filtering (numeric detection, BAT/WAT
+        ## pattern matching) is handled by select_numeric_count_columns().
+        cols_to_drop <- sort(unique(c(1, sym_idx)))
+        dropped_names <- cn[cols_to_drop]
+        cat("[INFO] Dropping identifier columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
+        counts_raw <- counts_raw[, -cols_to_drop, drop = FALSE]
       } else {
         ## No Symbol column — fall back to col1 as gene identifier
         gene_col <- as.character(counts_raw[[1]])
@@ -647,13 +632,25 @@ tryCatch({
     pdata_norm <- normalize_sample_id(pdata_id)
     counts_norm <- normalize_sample_id(colnames(counts_raw))
 
+    ## Step 1: match count column names -> GEO accession IDs
     map_idx <- match(counts_norm, pdata_norm)
     matched <- !is.na(map_idx)
+    cat("[SANITY] Sample-name matching (GEO accession):", sum(matched), "of",
+        length(counts_norm), "count columns matched\n")
 
-    cat("[SANITY] Sample-name matching:", sum(matched), "of", length(counts_norm), "count columns matched to metadata\n")
+    ## Step 2: if that failed, try matching against GEO sample titles
+    ##   GEO pdata$title often contains the original sample names used
+    ##   as column headers in the count file (e.g. "JojuBAT", "JojuWAT").
+    if (sum(matched) < 2 && "title" %in% colnames(pdata)) {
+      title_norm <- normalize_sample_id(pdata$title)
+      map_idx <- match(counts_norm, title_norm)
+      matched <- !is.na(map_idx)
+      cat("[SANITY] Sample-name matching (GEO title):", sum(matched), "of",
+          length(counts_norm), "count columns matched\n")
+    }
 
+    ## Step 3: order-based fallback (last resort) — only if dimensions agree
     if (sum(matched) < 2) {
-      ## Last resort: strict order match only if dimensions agree
       cat("[WARN] Weak sample-name matching; attempting order-based fallback\n")
       if (ncol(counts_raw) != nrow(pdata)) {
         stop("Unable to align count columns to metadata: matched ", sum(matched),

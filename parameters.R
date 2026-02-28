@@ -89,6 +89,19 @@ MIN_COUNTS_PER_GENE  <- 10       # minimum counts per sample to consider gene "d
 MIN_SAMPLES_DETECTED <- NULL     # NULL = auto-detect smallest group size (recommended)
 LOW_COUNT_FILTER     <- TRUE     # apply low-count filtering
 
+## ---- Filtering mode --------------------------------------
+## Options: deseq2_default | cpm | filterByExpr | intersection
+FILTER_MODE         <- "filterByExpr"
+
+## ---- Scaling gate ----------------------------------------
+## If NULL, auto-trigger only when final gene-level median library size is very high.
+DO_SCALE_COUNTS     <- NULL
+LIBSIZE_SCALE_GATE  <- 2e8
+TARGET_LIB_SIZE     <- 2e7
+
+## ---- Sample exclusion policy -----------------------------
+EXCLUDE_SAMPLES     <- character(0)  # explicit sample IDs (GSM...) only; default none
+
 ## ---- Annotation database ---------------------------------
 ORG_DB             <- "org.Hs.eg.db"
 GENOME             <- "hg38"

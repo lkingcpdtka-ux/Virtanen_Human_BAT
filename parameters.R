@@ -18,20 +18,21 @@ STUDY_DESCRIPTION   <- paste(
 )
 
 ## ---- Sample information ----------------------------------
-N_SUBJECTS         <- 14
-N_SAMPLES_EXPECTED <- 28          # 14 BAT + 14 WAT (paired)
+N_SUBJECTS         <- 15            # GEO has 15; paper excluded 1 post-hoc
+N_SAMPLES_EXPECTED <- 30            # 15 BAT + 15 WAT (paired)
 CONDITION_COL      <- "tissue"    # column name in colData
 CONDITION_REF      <- "WAT"       # reference level (denominator)
 CONDITION_TEST     <- "BAT"       # test level (numerator)
 SUBJECT_COL        <- "subject"   # for paired design
+SUBJECTS_TO_EXCLUDE <- NULL       # e.g. c("SubjectName") after PCA review
 
 ## ---- DE thresholds (from paper) --------------------------
 PADJ_CUTOFF        <- 0.05
 LFC_CUTOFF         <- 1.0         # log2 fold-change >= 1
 
 ## ---- Expected DEG counts (paper Table S1 / Figure 1) ----
-EXPECTED_UP_BAT    <- 847         # genes higher in BAT
-EXPECTED_UP_WAT    <- 928         # genes higher in WAT
+EXPECTED_UP_BAT    <- 463         # paper: 463 BAT-enriched genes (14 subjects)
+EXPECTED_UP_WAT    <- 928         # genes higher in WAT (paper does not specify)
 DEG_COUNT_TOLERANCE <- 0.20       # allow 20% deviation
 
 ## ---- BAT marker genes (from paper) ----------------------
@@ -84,8 +85,8 @@ HEATMAP_TOP_N      <- 50         # top N DEGs for heatmap
 HEATMAP_SCALE      <- "row"      # z-score scaling
 
 ## ---- QC thresholds ---------------------------------------
-MIN_COUNTS_PER_GENE  <- 10       # minimum total counts to keep gene
-MIN_SAMPLES_DETECTED <- 3        # gene must be detected in >= N samples
+MIN_COUNTS_PER_GENE  <- 10       # minimum counts per sample to consider gene "detected"
+MIN_SAMPLES_DETECTED <- NULL     # NULL = auto-detect smallest group size (recommended)
 LOW_COUNT_FILTER     <- TRUE     # apply low-count filtering
 
 ## ---- Annotation database ---------------------------------

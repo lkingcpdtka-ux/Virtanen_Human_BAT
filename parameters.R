@@ -106,7 +106,7 @@ FLAGGED_SUBJECTS    <- character(0)  # optional subject labels for bounded influ
 ## ---- Annotation database ---------------------------------
 ORG_DB             <- "org.Hs.eg.db"
 GENOME             <- "hg38"
-GENE_ID_TYPE       <- "ENSEMBL"  # GEO counts use ENSEMBL IDs
+GENE_ID_TYPE       <- "ENTREZID" # NCBI-generated counts use Entrez Gene IDs (converted to HGNC symbols)
 KEGG_ORGANISM      <- "hsa"
 
 ## ---- Reproducibility -------------------------------------
@@ -119,6 +119,6 @@ SAVECORE_MODE      <- "new"      # new | resume_latest | resume_tag
 SAVECORE_RUN_TAG   <- NULL       # used only when SAVECORE_MODE == "resume_tag"
 
 ## ---- Optional local counts override ----------------------
-LOCAL_COUNTS_PATH  <- NULL       # e.g. "GSE113764_humanBATWAT.txt.gz"
+LOCAL_COUNTS_PATH  <- NULL       # e.g. "GSE113764_raw_counts_GRCh38.p13_NCBI.tsv.gz"
 
 cat("[OK] parameters.R loaded for", STUDY_TITLE, "\n")

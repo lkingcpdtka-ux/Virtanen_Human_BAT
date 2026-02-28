@@ -102,6 +102,63 @@ read_geo_counts_with_fallback <- function(path, is_gz = FALSE) {
        ". Please provide a plain text count table via LOCAL_COUNTS_PATH.")
 }
 
+download_ncbi_counts <- function(geo_accession, dest_dir) {
+  ## Download NCBI-generated RNA-seq raw counts (GRCh38.p13 pipeline).
+  ## These are standardised count tables produced by NCBI's pipeline,
+
+  ## separate from the author-submitted supplementary files.
+  fname <- paste0(geo_accession, "_raw_counts_GRCh38.p13_NCBI.tsv.gz")
+  dest  <- file.path(dest_dir, fname)
+  if (file.exists(dest)) {
+    cat("[INFO] NCBI counts file already downloaded:", basename(dest), "\n")
+    return(dest)
+  }
+  url <- paste0("https://www.ncbi.nlm.nih.gov/geo/download/?type=rnaseq_counts",
+                "&acc=", geo_accession,
+                "&format=file",
+                "&file=", fname)
+  cat("[INFO] Downloading NCBI-generated counts from:\n       ", url, "\n")
+  status <- tryCatch({
+    download.file(url, dest, mode = "wb", quiet = FALSE)
+    0L
+  }, error = function(e) {
+    warning("[WARN] NCBI counts download failed: ", conditionMessage(e))
+    1L
+  })
+  if (status != 0 || !file.exists(dest) || file.size(dest) < 100) {
+    if (file.exists(dest)) file.remove(dest)
+    return(NULL)
+  }
+  cat("[INFO] Downloaded NCBI counts:", basename(dest),
+      "(", round(file.size(dest) / 1024), "KB )\n")
+  return(dest)
+}
+
+convert_entrez_to_symbol <- function(entrez_ids) {
+  ## Map NCBI Entrez Gene IDs to HGNC symbols using org.Hs.eg.db.
+  if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    stop("org.Hs.eg.db is required for Entrez-to-symbol conversion. ",
+         "Install with: BiocManager::install('org.Hs.eg.db')")
+  }
+  if (!requireNamespace("AnnotationDbi", quietly = TRUE)) {
+    stop("AnnotationDbi is required for Entrez-to-symbol conversion.")
+  }
+  entrez_ids <- as.character(entrez_ids)
+  mapped <- AnnotationDbi::mapIds(
+    org.Hs.eg.db::org.Hs.eg.db,
+    keys    = entrez_ids,
+    column  = "SYMBOL",
+    keytype = "ENTREZID",
+    multiVals = "first"
+  )
+  symbols <- as.character(mapped[entrez_ids])
+  n_mapped  <- sum(!is.na(symbols))
+  n_total   <- length(entrez_ids)
+  cat("[INFO] Entrez-to-symbol mapping: ", n_mapped, " / ", n_total,
+      " (", round(100 * n_mapped / n_total, 1), "%) mapped\n", sep = "")
+  symbols
+}
+
 verify_output_file <- function(path, label = "output", must_exist = TRUE) {
   ok <- file.exists(path)
   if (ok) {
@@ -214,7 +271,7 @@ find_local_count_file <- function(geo_accession, workdir) {
 
   candidates <- list.files(
     workdir,
-    pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv)(\\.gz)?$"),
+    pattern = paste0("^", geo_accession, ".*(humanBATWAT|count|raw).*(txt|csv|tsv)(\\.gz)?$"),
     full.names = TRUE,
     ignore.case = TRUE
   )
@@ -455,24 +512,29 @@ tryCatch({
     gse <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, getGPL = FALSE)
     gse <- gse[[1]]
 
-    ## Try local counts first; otherwise download GEO supplementary file
+    ## Try local counts first; then NCBI-generated counts; finally GEO supp files
     supp_dir <- file.path(cache_dir, "geo_supp")
     dir.create(supp_dir, recursive = TRUE, showWarnings = FALSE)
 
     local_count_file <- find_local_count_file(GEO_ACCESSION, getwd())
     count_file <- NULL
+    is_ncbi_counts <- FALSE
 
     if (!is.null(local_count_file)) {
       count_file <- local_count_file
+      ## Detect if local file is an NCBI-generated counts file
+      is_ncbi_counts <- grepl("raw_counts_GRCh38.*NCBI", basename(count_file), ignore.case = TRUE)
     } else {
-      supp_files <- getGEOSuppFiles(GEO_ACCESSION, baseDir = supp_dir,
-                                     makeDirectory = FALSE)
-
-      count_candidates <- rownames(supp_files)[grepl("count|raw|humanBATWAT|txt|csv",
-                                                     rownames(supp_files),
-                                                     ignore.case = TRUE)]
-      if (length(count_candidates) > 0) {
-        count_file <- count_candidates[1]
+      ## Download NCBI-generated raw counts (standardised GRCh38.p13 pipeline)
+      ncbi_file <- download_ncbi_counts(GEO_ACCESSION, supp_dir)
+      if (!is.null(ncbi_file)) {
+        count_file <- ncbi_file
+        is_ncbi_counts <- TRUE
+      } else {
+        stop("Could not download NCBI-generated counts file for ", GEO_ACCESSION,
+             ". Download GSE113764_raw_counts_GRCh38.p13_NCBI.tsv.gz manually from\n",
+             "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE113764\n",
+             "and place it in the working directory, or set LOCAL_COUNTS_PATH.")
       }
     }
 
@@ -488,35 +550,33 @@ tryCatch({
              ". If this is a gzipped file without .gz extension, recompress/rename or set LOCAL_COUNTS_PATH correctly.")
       }
 
-      ## ---- Smart gene-ID extraction ----
-      ## GEO count files vary in structure.  Common layouts:
-      ##   (a) col1 = ENSG/symbol, rest = counts
-      ##   (b) col1 = transcript accession, "Symbol" col has gene names, rest = counts
-      ## We prefer a "Symbol" column if it contains recognisable gene names.
+      ## ---- Gene-ID extraction ----
       cn <- colnames(counts_raw)
 
-      ## Look for a dedicated Symbol / GeneName column
-      symbol_col_idx <- grep("^(symbol|gene[._]?name|gene[._]?symbol|hgnc)$",
-                              cn, ignore.case = TRUE)
-
-      if (length(symbol_col_idx) > 0) {
-        ## Found a Symbol column  use it as the gene identifier
-        sym_idx <- symbol_col_idx[1]
-        gene_col <- as.character(counts_raw[[sym_idx]])
-        cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
-
-        ## Drop the first column (accession) and the Symbol column.
-        ## All remaining column filtering (numeric detection, BAT/WAT
-        ## pattern matching) is handled by select_numeric_count_columns().
-        cols_to_drop <- sort(unique(c(1, sym_idx)))
-        dropped_names <- cn[cols_to_drop]
-        cat("[INFO] Dropping identifier columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
-        counts_raw <- counts_raw[, -cols_to_drop, drop = FALSE]
-      } else {
-        ## No Symbol column  fall back to col1 as gene identifier
-        gene_col <- as.character(counts_raw[[1]])
+      if (is_ncbi_counts) {
+        ## NCBI counts: col1 = GeneID (Entrez), rest = GSM sample columns
+        entrez_ids <- as.character(counts_raw[[1]])
         counts_raw <- counts_raw[, -1, drop = FALSE]
-        cat("[INFO] No 'Symbol' column found; using column 1 as gene identifier\n")
+        cat("[INFO] NCBI counts detected: converting Entrez Gene IDs to HGNC symbols\n")
+        gene_col <- convert_entrez_to_symbol(entrez_ids)
+      } else {
+        ## Author-submitted files: try Symbol column, else use col1
+        symbol_col_idx <- grep("^(symbol|gene[._]?name|gene[._]?symbol|hgnc)$",
+                                cn, ignore.case = TRUE)
+
+        if (length(symbol_col_idx) > 0) {
+          sym_idx <- symbol_col_idx[1]
+          gene_col <- as.character(counts_raw[[sym_idx]])
+          cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
+          cols_to_drop <- sort(unique(c(1, sym_idx)))
+          dropped_names <- cn[cols_to_drop]
+          cat("[INFO] Dropping identifier columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
+          counts_raw <- counts_raw[, -cols_to_drop, drop = FALSE]
+        } else {
+          gene_col <- as.character(counts_raw[[1]])
+          counts_raw <- counts_raw[, -1, drop = FALSE]
+          cat("[INFO] No 'Symbol' column found; using column 1 as gene identifier\n")
+        }
       }
 
       counts_raw <- select_numeric_count_columns(as.data.frame(counts_raw))

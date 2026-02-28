@@ -101,7 +101,7 @@ TARGET_LIB_SIZE     <- 2e7
 
 ## ---- Sample exclusion policy -----------------------------
 EXCLUDE_SAMPLES     <- character(0)  # explicit sample IDs (GSM...) only; default none
-FLAGGED_SUBJECTS    <- character(0)  # optional extra flagged subjects for bounded sensitivity re-fits
+FLAGGED_SUBJECTS    <- character(0)  # optional subject labels for bounded influence checks
 
 ## ---- Annotation database ---------------------------------
 ORG_DB             <- "org.Hs.eg.db"

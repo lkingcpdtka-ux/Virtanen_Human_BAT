@@ -1617,12 +1617,42 @@ tryCatch({
         paste(neg_subjects, collapse = ", "), "\n\n", sep = "")
 
     ## ---- Active-BAT stratified model ----
-    keep_active <- colData(se_filt)$subject_label %in% pos_subjects
-    se_active <- se_filt[, keep_active]
+    ## Use the UNFILTERED SE and re-filter within this subgroup so we
+    ## don't lose genes that are only expressed in active-BAT tissue.
+    keep_active <- colData(se)$subject_label %in% pos_subjects
+    se_active <- se[, keep_active]
     se_active$subject <- droplevels(se_active$subject)
+
+    ## Independent low-count filter for this subgroup
+    active_counts <- assay(se_active, "counts")
+    active_counts <- round(active_counts)
+    storage.mode(active_counts) <- "integer"
+    active_nonzero <- rowSums(active_counts > 0) > 0
+    active_counts_nz <- active_counts[active_nonzero, , drop = FALSE]
+    min_group_active <- min(table(se_active$tissue))
+    active_keep <- edgeR::filterByExpr(active_counts_nz, group = se_active$tissue,
+                                        min.count = max(MIN_COUNTS_PER_GENE,
+                                                        ceiling(median(colSums(active_counts)) / 1e6)))
+    se_active <- se_active[rownames(active_counts_nz)[active_keep], ]
+    assay(se_active, "counts") <- round(assay(se_active, "counts"))
+    storage.mode(assay(se_active, "counts")) <- "integer"
 
     cat("[STRAT] Active-BAT subset: ", ncol(se_active), " samples from ",
         nlevels(se_active$subject), " subjects\n", sep = "")
+    cat("[STRAT] Independent filter: ", nrow(se_active), " genes kept",
+        " (vs ", nrow(se_filt), " from global filter)\n", sep = "")
+
+    ## Check for genes rescued by independent filtering
+    rescued <- setdiff(rownames(se_active), rownames(se_filt))
+    if (length(rescued) > 0) {
+      cat("[STRAT] Rescued ", length(rescued),
+          " genes not in global filter (active-BAT specific)\n", sep = "")
+      ## Report if any key genes were rescued
+      key_rescued <- intersect(rescued, c("CLDN1", "UCP1", BAT_MARKER_GENES, "PPARG", "LEP"))
+      if (length(key_rescued) > 0) {
+        cat("[STRAT] Key genes rescued: ", paste(key_rescued, collapse = ", "), "\n", sep = "")
+      }
+    }
 
     dds_active <- DESeqDataSet(se_active, design = ~ subject + tissue)
     dds_active$tissue <- relevel(dds_active$tissue, ref = CONDITION_REF)
@@ -1698,12 +1728,26 @@ tryCatch({
 
     ## ---- Inactive-BAT stratified model ----
     if (length(neg_subjects) >= 3) {
-      keep_inactive <- colData(se_filt)$subject_label %in% neg_subjects
-      se_inactive <- se_filt[, keep_inactive]
+      keep_inactive <- colData(se)$subject_label %in% neg_subjects
+      se_inactive <- se[, keep_inactive]
       se_inactive$subject <- droplevels(se_inactive$subject)
+
+      ## Independent low-count filter for inactive subgroup
+      inact_counts <- assay(se_inactive, "counts")
+      inact_counts <- round(inact_counts)
+      storage.mode(inact_counts) <- "integer"
+      inact_nonzero <- rowSums(inact_counts > 0) > 0
+      inact_counts_nz <- inact_counts[inact_nonzero, , drop = FALSE]
+      inact_keep <- edgeR::filterByExpr(inact_counts_nz, group = se_inactive$tissue,
+                                         min.count = max(MIN_COUNTS_PER_GENE,
+                                                         ceiling(median(colSums(inact_counts)) / 1e6)))
+      se_inactive <- se_inactive[rownames(inact_counts_nz)[inact_keep], ]
+      assay(se_inactive, "counts") <- round(assay(se_inactive, "counts"))
+      storage.mode(assay(se_inactive, "counts")) <- "integer"
 
       cat("\n[STRAT] Inactive-BAT subset: ", ncol(se_inactive), " samples from ",
           nlevels(se_inactive$subject), " subjects\n", sep = "")
+      cat("[STRAT] Independent filter: ", nrow(se_inactive), " genes kept\n", sep = "")
 
       dds_inactive <- DESeqDataSet(se_inactive, design = ~ subject + tissue)
       dds_inactive$tissue <- relevel(dds_inactive$tissue, ref = CONDITION_REF)

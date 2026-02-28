@@ -1,14 +1,14 @@
 ## =========================================================
-## Part 1 — Main Analysis: Virtanen Human BAT RNA-seq
+## Part 1  Main Analysis: Virtanen Human BAT RNA-seq
 ## =========================================================
 ## Goal : Determine whether CLDN1 is increased in human BAT
 ##        relative to paired subcutaneous WAT
 ## Data : GSE113764 (Virtanen et al. Cell Metabolism 2018)
-## Design: Paired — 14 subjects × 2 tissues (BAT / WAT)
+## Design: Paired  14 subjects  2 tissues (BAT / WAT)
 ## Model : ~ subject + tissue  (paired DESeq2)
 ## =========================================================
 
-cat("=== Part 1: Virtanen Human BAT — CLDN1 validation ===\n")
+cat("=== Part 1: Virtanen Human BAT  CLDN1 validation ===\n")
 cat("Start time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
 
 
@@ -128,8 +128,8 @@ print_run_structure_sanity <- function(outdir) {
 normalize_sample_id <- function(x) {
   x <- as.character(x)
   x <- tolower(x)
-  ## Transliterate accented characters to ASCII (ä→a, ö→o, etc.)
-  ## before stripping, so Finnish names like "Päoi" match correctly.
+  ## Transliterate accented characters to ASCII (a, o, etc.)
+  ## before stripping, so Finnish names like "Poi" match correctly.
   x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
   gsub("[^a-z0-9]", "", x)
 }
@@ -227,6 +227,81 @@ find_local_count_file <- function(geo_accession, workdir) {
   return(NULL)
 }
 
+extract_geo_covariates <- function(pdata) {
+  txt_fields <- grep("characteristics|title|source|description", colnames(pdata),
+                     ignore.case = TRUE, value = TRUE)
+  txt_df <- as.data.frame(pdata[, txt_fields, drop = FALSE], stringsAsFactors = FALSE)
+  txt <- apply(txt_df, 1, function(x) paste(as.character(x), collapse = " | "))
+
+  extract_numeric <- function(pattern) {
+    out <- rep(NA_real_, length(txt))
+    m <- regexec(paste0("(?i)", pattern, "[^0-9]*([0-9]+\\.?[0-9]*)"), txt, perl = TRUE)
+    hits <- regmatches(txt, m)
+    ok <- lengths(hits) >= 2
+    out[ok] <- suppressWarnings(as.numeric(vapply(hits[ok], `[`, character(1), 2)))
+    out
+  }
+
+  cov <- data.frame(
+    BAT_status = rep(NA_character_, length(txt)),
+    cold_exposure = rep(NA_character_, length(txt)),
+    feeding_state = rep(NA_character_, length(txt)),
+    sex = rep(NA_character_, length(txt)),
+    age = extract_numeric("age"),
+    BMI = extract_numeric("bmi|body mass index"),
+    RIN = extract_numeric("rin"),
+    DV200 = extract_numeric("dv200"),
+    stringsAsFactors = FALSE
+  )
+
+  pos <- grepl("(bat|pet|fdg).*(positive|pos|high)", txt, ignore.case = TRUE) |
+    grepl("(positive|pos|high).*(bat|pet|fdg)", txt, ignore.case = TRUE)
+  neg <- grepl("(bat|pet|fdg).*(negative|neg|low)", txt, ignore.case = TRUE) |
+    grepl("(negative|neg|low).*(bat|pet|fdg)", txt, ignore.case = TRUE)
+  cov$BAT_status[pos] <- "pos"
+  cov$BAT_status[neg] <- "neg"
+
+  cov$cold_exposure[grepl("cold", txt, ignore.case = TRUE)] <- "yes"
+  cov$cold_exposure[grepl("room temperature|thermoneutral", txt, ignore.case = TRUE)] <- "no"
+
+  cov$feeding_state[grepl("\bfed\b|postprand", txt, ignore.case = TRUE)] <- "fed"
+  cov$feeding_state[grepl("fast|fasted|overnight", txt, ignore.case = TRUE)] <- "fasted"
+
+  cov$sex[grepl("female|\bF\b", txt, ignore.case = TRUE)] <- "female"
+  cov$sex[grepl("male|\bM\b", txt, ignore.case = TRUE)] <- "male"
+
+  keyword_patterns <- c(
+    BAT = "\\bBAT\\b|brown", WAT = "\\bWAT\\b|white", PET = "pet|fdg",
+    positive = "positive", negative = "negative", cold = "cold",
+    room = "room", temperature = "temperature", meal = "meal",
+    fast = "fast", fed = "fed", RIN = "rin", DV200 = "dv200",
+    BMI = "bmi", sex = "sex|male|female", age = "age"
+  )
+  keyword_hits <- as.data.frame(lapply(keyword_patterns, function(pat) grepl(pat, txt, ignore.case = TRUE)),
+                                stringsAsFactors = FALSE)
+
+  list(covariates = cov, keyword_hits = keyword_hits, metadata_text = txt, metadata_fields = txt_df)
+}
+
+get_model_metrics <- function(res_tbl, padj_cut = 0.05, lfc_cut = 1) {
+  list(
+    n_tested = nrow(res_tbl),
+    n_up_bat = sum(res_tbl$padj < padj_cut & res_tbl$log2FoldChange >= lfc_cut, na.rm = TRUE),
+    n_up_wat = sum(res_tbl$padj < padj_cut & res_tbl$log2FoldChange <= -lfc_cut, na.rm = TRUE)
+  )
+}
+
+extract_gene_line <- function(res_tbl, gene_symbol) {
+  rr <- res_tbl[res_tbl$symbol == gene_symbol, , drop = FALSE]
+  if (nrow(rr) == 0) {
+    return(data.frame(symbol = gene_symbol, log2FoldChange = NA_real_, pvalue = NA_real_,
+                      padj = NA_real_, baseMean = NA_real_, stringsAsFactors = FALSE))
+  }
+  rr <- rr[1, ]
+  data.frame(symbol = gene_symbol, log2FoldChange = rr$log2FoldChange, pvalue = rr$pvalue,
+             padj = rr$padj, baseMean = rr$baseMean, stringsAsFactors = FALSE)
+}
+
 ## ---- 1) Packages -----------------------------------------
 required_pkgs <- c(
   "DESeq2", "edgeR", "GEOquery", "SummarizedExperiment",
@@ -316,14 +391,14 @@ set.seed(SEED)
 sanity <- list()
 
 ## ==========================================================
-## 4) MAIN ANALYSIS — wrapped in tryCatch
+## 4) MAIN ANALYSIS  wrapped in tryCatch
 ## ==========================================================
 tryCatch({
 
   ## ---- 4.1) Download / load GEO data ---------------------
   cat("== 4.1  Fetching GEO data:", GEO_ACCESSION, "==\n")
 
-  ## Clean slate — prevent stale objects from a previous run in the same
+  ## Clean slate  prevent stale objects from a previous run in the same
   ## R session from silently skipping the rebuild.
   if (exists("se", inherits = FALSE))  rm(se)
   if (exists("dds", inherits = FALSE)) rm(dds)
@@ -425,7 +500,7 @@ tryCatch({
                               cn, ignore.case = TRUE)
 
       if (length(symbol_col_idx) > 0) {
-        ## Found a Symbol column — use it as the gene identifier
+        ## Found a Symbol column  use it as the gene identifier
         sym_idx <- symbol_col_idx[1]
         gene_col <- as.character(counts_raw[[sym_idx]])
         cat("[INFO] Using column '", cn[sym_idx], "' as gene identifier\n", sep = "")
@@ -438,7 +513,7 @@ tryCatch({
         cat("[INFO] Dropping identifier columns: ", paste(dropped_names, collapse = ", "), "\n", sep = "")
         counts_raw <- counts_raw[, -cols_to_drop, drop = FALSE]
       } else {
-        ## No Symbol column — fall back to col1 as gene identifier
+        ## No Symbol column  fall back to col1 as gene identifier
         gene_col <- as.character(counts_raw[[1]])
         counts_raw <- counts_raw[, -1, drop = FALSE]
         cat("[INFO] No 'Symbol' column found; using column 1 as gene identifier\n")
@@ -499,14 +574,14 @@ tryCatch({
       ## If lib sizes are >1 billion, data may be transcript-level or pre-scaled.
       if (median(lib_sizes_raw) > 1e9) {
         cat("[A1] WARNING: Median library size is ", format(median(lib_sizes_raw), big.mark = ","),
-            " — this is FAR above typical RNA-seq (10M-200M).\n", sep = "")
+            "  this is FAR above typical RNA-seq (10M-200M).\n", sep = "")
         cat("     Possible causes:\n")
         cat("     - Data is at transcript level (needs gene-level aggregation)\n")
         cat("     - Genomatix weighted counts (not raw read counts)\n")
         cat("     - Pre-scaled or multiplied values\n")
         cat("     DESeq2 may still work, but interpret size factors carefully.\n")
       } else if (median(lib_sizes_raw) >= 1e6 && median(lib_sizes_raw) <= 5e8) {
-        cat("[A1] OK — library sizes in typical RNA-seq range\n")
+        cat("[A1] OK  library sizes in typical RNA-seq range\n")
       }
 
       ## A2. Gene ID classification
@@ -569,7 +644,7 @@ tryCatch({
       for (kg in key_genes) {
         idx <- which(gene_ids == kg)
         if (length(idx) > 0) {
-          cat("[A5] ", kg, " present — row sum = ",
+          cat("[A5] ", kg, " present  row sum = ",
               format(row_sums[idx[1]], big.mark = ","),
               ", mean = ", round(mean(as.numeric(counts_raw[idx[1], ])), 1), "\n", sep = "")
         } else {
@@ -652,7 +727,7 @@ tryCatch({
           length(counts_norm), "count columns matched\n")
     }
 
-    ## Step 3: order-based fallback (last resort) — only if dimensions agree
+    ## Step 3: order-based fallback (last resort)  only if dimensions agree
     if (sum(matched) < 2) {
       cat("[WARN] Weak sample-name matching; attempting order-based fallback\n")
       if (ncol(counts_raw) != nrow(pdata)) {
@@ -666,10 +741,12 @@ tryCatch({
       matched <- rep(TRUE, ncol(counts_raw))
     }
 
+    original_count_colnames <- colnames(counts_raw)
     counts_raw <- counts_raw[, matched, drop = FALSE]
     map_idx <- map_idx[matched]
     pdata <- pdata[map_idx, , drop = FALSE]
 
+    original_count_colnames <- original_count_colnames[matched]
     sample_ids <- pdata_id[map_idx]
     colnames(counts_raw) <- sample_ids
     rownames(pdata) <- sample_ids
@@ -691,9 +768,13 @@ tryCatch({
     pdata <- pdata[keep_samples, , drop = FALSE]
 
     ## Build SummarizedExperiment
+    ## Use safe subject IDs for model-matrix column names (avoid DESeq2 note
+    ## about non-standard characters, e.g. diacritics in subject labels).
+    subject_safe <- normalize_sample_id(pdata$subject)
     col_data <- DataFrame(
       tissue  = factor(pdata$tissue, levels = c(CONDITION_REF, CONDITION_TEST)),
-      subject = factor(pdata$subject),
+      subject = factor(subject_safe),
+      subject_label = as.character(pdata$subject),
       row.names = rownames(pdata)
     )
 
@@ -716,6 +797,82 @@ tryCatch({
   cat("[SANITY] Subjects with paired samples (top 10):\n")
   subj_tab <- sort(table(se$subject), decreasing = TRUE)
   print(head(subj_tab, 10))
+
+  ## ---- SANITY BLOCK META: metadata + hidden covariates ----
+  cat("\n--- SANITY BLOCK META: Sample metadata and hidden covariates ---\n")
+  gse_meta <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, getGPL = FALSE)[[1]]
+  pdata_meta <- pData(gse_meta)
+  pdata_meta$sample_id <- ifelse(is.na(pdata_meta$geo_accession) | pdata_meta$geo_accession == "",
+                                 rownames(pdata_meta), as.character(pdata_meta$geo_accession))
+  rownames(pdata_meta) <- pdata_meta$sample_id
+  pdata_meta <- pdata_meta[colnames(se), , drop = FALSE]
+
+  covar_out <- extract_geo_covariates(pdata_meta)
+  parsed_meta <- data.frame(
+    sample_id = colnames(se),
+    subject = as.character(colData(se)$subject_label),
+    tissue = as.character(colData(se)$tissue),
+    BAT_status = covar_out$covariates$BAT_status,
+    cold_exposure = covar_out$covariates$cold_exposure,
+    feeding_state = covar_out$covariates$feeding_state,
+    sex = covar_out$covariates$sex,
+    age = covar_out$covariates$age,
+    BMI = covar_out$covariates$BMI,
+    RIN = covar_out$covariates$RIN,
+    DV200 = covar_out$covariates$DV200,
+    original_count_column = if (exists("original_count_colnames")) original_count_colnames else colnames(se),
+    stringsAsFactors = FALSE
+  )
+
+  sample_map_file <- file.path(outdir, "tables", "sample_metadata_mapping.csv")
+  sample_meta_full_file <- file.path(outdir, "tables", "sample_metadata_full.csv")
+  sample_meta_parsed_file <- file.path(outdir, "tables", "sample_metadata_parsed.csv")
+
+  write.csv(parsed_meta, sample_map_file, row.names = FALSE)
+  write.csv(data.frame(sample_id = rownames(pdata_meta), pdata_meta, check.names = FALSE),
+            sample_meta_full_file, row.names = FALSE)
+  write.csv(parsed_meta, sample_meta_parsed_file, row.names = FALSE)
+  verify_output_file(sample_map_file, "Sample metadata map")
+  verify_output_file(sample_meta_full_file, "Sample metadata full")
+  verify_output_file(sample_meta_parsed_file, "Sample metadata parsed")
+
+  cat("[META] Subject count in parsed metadata:", length(unique(parsed_meta$subject)), "\n")
+  cat("[META] Tissue counts in parsed metadata:\n")
+  print(table(parsed_meta$tissue, useNA = "ifany"))
+  cat("[META] #missing by covariate:\n")
+  print(colSums(is.na(parsed_meta[, c("BAT_status", "cold_exposure", "feeding_state", "sex", "age", "BMI", "RIN", "DV200")])) )
+  for (cc in c("BAT_status", "cold_exposure", "feeding_state", "sex")) {
+    cat("[META]", cc, "levels:\n")
+    print(table(parsed_meta[[cc]], useNA = "ifany"))
+  }
+
+  subject_counts <- table(parsed_meta$subject, parsed_meta$tissue)
+  if (all(rowSums(subject_counts > 0) == 2)) {
+    cat("[META] OK: all subjects have paired BAT+WAT samples in metadata.\n")
+  } else {
+    cat("[META] WARNING: some subjects are not paired in metadata.\n")
+  }
+
+  cat("[META] Paper-cohort mismatch check:\n")
+  cat("       N subjects in GEO metadata:", length(unique(parsed_meta$subject)), "\n")
+  cat("       N subjects in count matrix:", nlevels(se$subject), "\n")
+  cat("       Subject IDs (metadata):", paste(sort(unique(parsed_meta$subject)), collapse = ", "), "\n")
+
+  cohort_cols <- grep("cohort|group|project", colnames(pdata_meta), ignore.case = TRUE, value = TRUE)
+  if (length(cohort_cols) > 0) {
+    cat("[META] Cohort/project-like fields detected:\n")
+    for (cc in cohort_cols) {
+      cat("  -", cc, ":", paste(unique(na.omit(as.character(pdata_meta[[cc]]))), collapse = " | "), "\n")
+    }
+  }
+
+  if (all(is.na(parsed_meta$BAT_status))) {
+    cat("[META] BAT_status/PET_status not found in GEO metadata.\n")
+  }
+  cat("--- END SANITY BLOCK META ---\n\n")
+
+  bat_status_by_sample <- parsed_meta$BAT_status
+  names(bat_status_by_sample) <- parsed_meta$sample_id
 
   ## ---- Sanity: are these raw counts or pre-normalised? ----
   ## Raw counts are integers >= 0 with most values in hundreds-thousands range.
@@ -747,7 +904,7 @@ tryCatch({
     cat("            Possible CPM or log-transformed data.\n")
     sanity$data_type_warning <- "UNUSUALLY_LOW"
   } else {
-    cat("[RAW-CHECK] OK — data looks like raw integer counts\n")
+    cat("[RAW-CHECK] OK  data looks like raw integer counts\n")
     sanity$data_type_warning <- "NONE"
   }
 
@@ -763,7 +920,7 @@ tryCatch({
     cat("[PAIRED] WARNING: ", length(unpaired), " subject(s) lack one tissue:\n", sep = "")
     for (u in unpaired) {
       present <- colnames(subj_tissue)[subj_tissue[u, ] > 0]
-      cat("         ", u, " — only has: ", paste(present, collapse = ", "), "\n", sep = "")
+      cat("         ", u, "  only has: ", paste(present, collapse = ", "), "\n", sep = "")
     }
     cat("[PAIRED] Removing unpaired subjects to avoid DESeq2 model errors\n")
     keep_paired <- !(se$subject %in% unpaired)
@@ -772,7 +929,7 @@ tryCatch({
     cat("[PAIRED] Remaining: ", ncol(se), " samples from ",
         nlevels(se$subject), " complete pairs\n", sep = "")
   } else {
-    cat("[PAIRED] OK — all ", nlevels(se$subject),
+    cat("[PAIRED] OK  all ", nlevels(se$subject),
         " subjects have both ", CONDITION_REF, " and ", CONDITION_TEST, "\n", sep = "")
   }
 
@@ -784,14 +941,23 @@ tryCatch({
     cat("         DESeq2 paired design expects exactly 1 per cell.\n")
   }
 
-  ## Exclude subjects if specified (to match paper's 14-subject cohort)
-  if (exists("SUBJECTS_TO_EXCLUDE") && !is.null(SUBJECTS_TO_EXCLUDE) &&
-      length(SUBJECTS_TO_EXCLUDE) > 0) {
-    keep_subj <- !(se$subject %in% SUBJECTS_TO_EXCLUDE)
-    cat("[FILTER] Excluding subjects:", paste(SUBJECTS_TO_EXCLUDE, collapse = ", "),
-        "->", sum(keep_subj), "of", ncol(se), "samples remain\n")
-    se <- se[, keep_subj]
-    se$subject <- droplevels(se$subject)
+  ## Optional explicit sample exclusions (disabled by default)
+  excluded_samples_df <- data.frame(sample_id = character(0), reason = character(0), stringsAsFactors = FALSE)
+  if (exists("EXCLUDE_SAMPLES") && length(EXCLUDE_SAMPLES) > 0) {
+    drop_idx <- colnames(se) %in% EXCLUDE_SAMPLES
+    if (any(drop_idx)) {
+      excluded_samples_df <- data.frame(
+        sample_id = colnames(se)[drop_idx],
+        reason = "manual_EXCLUDE_SAMPLES",
+        stringsAsFactors = FALSE
+      )
+      se <- se[, !drop_idx]
+      se$subject <- droplevels(se$subject)
+      cat("[EXCLUDE] Applied EXCLUDE_SAMPLES:", paste(excluded_samples_df$sample_id, collapse = ", "), "\n")
+    }
+  }
+  if (nrow(excluded_samples_df) == 0) {
+    cat("[EXCLUDE] No exclusions applied.\n")
   }
 
   sanity$n_genes_raw   <- nrow(se)
@@ -802,7 +968,7 @@ tryCatch({
   ## ---- 4.2) Pre-filtering --------------------------------
   ## Standard approach (Nature/Cell Metabolism convention):
   ##   Keep genes with CPM >= 1 in at least the smallest group size.
-  ## This is purely count-driven — no gene-ID pattern matching needed.
+  ## This is purely count-driven  no gene-ID pattern matching needed.
   ## Non-coding junk (GenBank accessions etc.) naturally drops out
   ## because those features have zero/near-zero counts.
   ##
@@ -827,49 +993,79 @@ tryCatch({
   counts_mat[counts_mat < 0] <- 0
   counts_mat <- round(counts_mat)
 
-  ## ---- Detect and correct grossly inflated counts ----
-  ## Some GEO datasets (e.g. Genomatix pipeline output) have weighted/scaled
-  ## counts that are 1000-100000x larger than raw read counts.  This causes:
-  ##   (a) integer overflow (R integer max = 2.1 billion)
-  ##   (b) poor DESeq2 dispersion estimation (expects raw count scale)
-  ##   (c) artificially conservative p-values -> fewer DEGs
-  ## Fix: proportionally scale ALL counts so median library size is ~20M.
-  ## This preserves fold-changes and relative proportions exactly.
-  pre_scale_lib <- colSums(counts_mat)
-  pre_scale_median <- median(pre_scale_lib)
+  ## ---- SANITY BLOCK SCALE: raw-count plausibility and scaling gate ----
+  lib_sizes_unscaled <- colSums(counts_mat)
+  median_lib_unscaled <- median(lib_sizes_unscaled)
+  scale_gate <- if (exists("LIBSIZE_SCALE_GATE")) LIBSIZE_SCALE_GATE else 2e8
+  target_lib_size <- if (exists("TARGET_LIB_SIZE")) TARGET_LIB_SIZE else 2e7
 
-  if (pre_scale_median > 1e9) {
-    target_lib_size <- 2e7  # 20 million — typical RNA-seq
-    scale_factor <- pre_scale_median / target_lib_size
-    cat("[SCALE] Median library size is ", format(pre_scale_median, big.mark = ","),
-        " — this is ", round(scale_factor), "x above typical RNA-seq.\n", sep = "")
-    cat("[SCALE] Data appears to be weighted/scaled counts (e.g. Genomatix),\n")
-    cat("        not raw read counts.  Proportionally scaling down by ",
-        round(scale_factor), "x\n", sep = "")
-    cat("[SCALE] to target ~", format(target_lib_size, big.mark = ","),
-        " median library size.\n", sep = "")
-    cat("[SCALE] This preserves all fold-changes and relative proportions.\n")
+  lib_q <- quantile(lib_sizes_unscaled, probs = c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1))
+  cat("[SCALE] Library size quantiles (unscaled):\n")
+  print(round(lib_q, 2))
 
+  frac_integer_all <- mean(counts_mat == round(counts_mat), na.rm = TRUE)
+  cat("[SCALE] Fraction integer values (full matrix):", round(frac_integer_all, 4), "\n")
+
+  set.seed(SEED)
+  subset_n <- min(2000, nrow(counts_mat))
+  subset_idx <- sample(seq_len(nrow(counts_mat)), subset_n)
+  g_mean <- rowMeans(counts_mat[subset_idx, , drop = FALSE])
+  g_var <- apply(counts_mat[subset_idx, , drop = FALSE], 1, var)
+  mv_ok <- g_mean > 0 & g_var > 0
+  mv_cor <- if (sum(mv_ok) > 10) cor(log10(g_mean[mv_ok]), log10(g_var[mv_ok]), method = "spearman") else NA_real_
+  cat("[SCALE] mean-variance Spearman cor(log10(mean),log10(var)):", round(mv_cor, 4), "\n")
+
+  sf_unscaled <- tryCatch(DESeq2::estimateSizeFactorsForMatrix(counts_mat), error = function(e) rep(NA_real_, ncol(counts_mat)))
+  sf_ok <- all(is.na(sf_unscaled)) || (min(sf_unscaled, na.rm = TRUE) >= 0.1 && max(sf_unscaled, na.rm = TRUE) <= 10)
+  if (!all(is.na(sf_unscaled))) {
+    cat("[SCALE] Size factors from unscaled matrix: min=", round(min(sf_unscaled), 3),
+        " median=", round(median(sf_unscaled), 3), " max=", round(max(sf_unscaled), 3), "\n", sep = "")
+  }
+  if (isTRUE(sf_ok)) cat("[SCALE] size factors normal (0.1-10)\n")
+
+  med_gene_count <- median(rowMeans(counts_mat), na.rm = TRUE)
+  extreme_sf <- !isTRUE(sf_ok)
+  extreme_median_gene <- is.finite(med_gene_count) && med_gene_count > 1e5
+
+  auto_scale <- (median_lib_unscaled > scale_gate) && (extreme_sf || extreme_median_gene)
+  if (exists("DO_SCALE_COUNTS") && !is.null(DO_SCALE_COUNTS)) {
+    do_scale_counts <- isTRUE(DO_SCALE_COUNTS)
+    cat("[SCALE] DO_SCALE_COUNTS explicitly set to", do_scale_counts, "\n")
+  } else {
+    do_scale_counts <- auto_scale
+    cat("[SCALE] Auto gate: median library size =",
+        format(median_lib_unscaled, big.mark = ","),
+        "| threshold =", format(scale_gate, big.mark = ","),
+        "-> DO_SCALE_COUNTS =", do_scale_counts, "\n")
+  }
+
+  sanity$libsize_unscaled_min <- min(lib_sizes_unscaled)
+  sanity$libsize_unscaled_median <- median_lib_unscaled
+  sanity$libsize_unscaled_max <- max(lib_sizes_unscaled)
+  write.csv(data.frame(sample_id = colnames(counts_mat), lib_size = as.numeric(lib_sizes_unscaled)),
+            file.path(outdir, "tables", "library_size_unscaled.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "library_size_unscaled.csv"), "Libsize unscaled")
+
+  if (do_scale_counts) {
+    scale_factor <- median_lib_unscaled / target_lib_size
+    cat("[SCALE] WARNING: Extremely large final gene-level libraries detected.\n")
+    cat("[SCALE] Scaling counts by factor", round(scale_factor, 4),
+        "to target median", format(target_lib_size, big.mark = ","), "\n")
     counts_mat <- round(counts_mat / scale_factor)
-
-    post_scale_lib <- colSums(counts_mat)
-    cat("[SCALE] Post-scaling library sizes: min=",
-        format(min(post_scale_lib), big.mark = ","),
-        " median=", format(median(post_scale_lib), big.mark = ","),
-        " max=", format(max(post_scale_lib), big.mark = ","), "\n", sep = "")
-
-    ## Verify key genes survived the scaling
-    for (kg in c("UCP1", "CLDN1", "ACTB")) {
-      if (kg %in% rownames(counts_mat)) {
-        kg_mean <- round(mean(counts_mat[kg, ]))
-        cat("[SCALE] ", kg, " mean count after scaling: ",
-            format(kg_mean, big.mark = ","), "\n", sep = "")
-      }
-    }
-
-    sanity$count_scale_factor <- round(scale_factor)
+    sanity$count_scale_factor <- round(scale_factor, 4)
   } else {
     sanity$count_scale_factor <- 1
+    cat("[SCALE] No scaling applied (preferred for count-like data and normal size-factor behavior).\n")
+  }
+
+  lib_sizes_scaled <- colSums(counts_mat)
+  sanity$libsize_scaled_min <- min(lib_sizes_scaled)
+  sanity$libsize_scaled_median <- median(lib_sizes_scaled)
+  sanity$libsize_scaled_max <- max(lib_sizes_scaled)
+  if (do_scale_counts) {
+    write.csv(data.frame(sample_id = colnames(counts_mat), lib_size = as.numeric(lib_sizes_scaled)),
+              file.path(outdir, "tables", "library_size_scaled.csv"), row.names = FALSE)
+    verify_output_file(file.path(outdir, "tables", "library_size_scaled.csv"), "Libsize scaled")
   }
 
   ## Final integer overflow check (should be rare/none after scaling)
@@ -877,14 +1073,15 @@ tryCatch({
   n_overflow <- sum(counts_mat > int_max)
   if (n_overflow > 0) {
     cat("[SANITY] WARNING: ", n_overflow,
-        " values still exceed integer max after scaling — capping\n", sep = "")
+        " values still exceed integer max after scaling  capping\n", sep = "")
     counts_mat[counts_mat > int_max] <- int_max
   }
 
   storage.mode(counts_mat) <- "integer"
   assay(se, "counts") <- counts_mat
 
-  if (LOW_COUNT_FILTER) {
+  filter_mode <- if (exists("FILTER_MODE")) FILTER_MODE else "filterByExpr"
+  if (LOW_COUNT_FILTER && filter_mode != "deseq2_default") {
     design_group <- se$tissue
     min_group    <- min(table(design_group))
     lib_sizes    <- colSums(counts_mat)
@@ -893,7 +1090,7 @@ tryCatch({
     cat("[FILTER] Smallest group size:", min_group, "samples\n")
     cat("[FILTER] Median library size:", format(med_lib, big.mark = ","), "\n")
 
-    ## Step 1: fast pre-screen — remove genes with zero counts in ALL samples.
+    ## Step 1: fast pre-screen  remove genes with zero counts in ALL samples.
     ##         This is instant and eliminates the bulk of ~217K features.
     nonzero <- rowSums(counts_mat > 0) > 0
     n_allzero <- sum(!nonzero)
@@ -901,28 +1098,27 @@ tryCatch({
     counts_mat_nz <- counts_mat[nonzero, , drop = FALSE]
     cat("[FILTER] After zero removal:", nrow(counts_mat_nz), "genes remain\n")
 
-    ## Step 2: CPM >= 1 in at least min_group samples (standard threshold).
-    ##         This is the workhorse filter used in most Nature/Cell papers.
     cpm_mat  <- t(t(counts_mat_nz) / lib_sizes * 1e6)
     keep_cpm <- rowSums(cpm_mat >= 1) >= min_group
-    n_pass_cpm <- sum(keep_cpm)
-    cat("[FILTER] Genes with CPM >= 1 in >=", min_group, "samples:", n_pass_cpm, "\n")
+    cat("[FILTER] Genes with CPM >= 1 in >=", min_group, "samples:", sum(keep_cpm), "\n")
 
-    ## Step 3 (optional): if edgeR available, refine with filterByExpr
-    ##         which also considers lib sizes and a min total count.
-    if (requireNamespace("edgeR", quietly = TRUE)) {
+    keep <- keep_cpm
+    if (filter_mode %in% c("filterByExpr", "intersection") && requireNamespace("edgeR", quietly = TRUE)) {
       min_count_cpm1 <- max(MIN_COUNTS_PER_GENE, ceiling(med_lib / 1e6))
       keep_expr <- edgeR::filterByExpr(counts_mat_nz, group = design_group,
                                        min.count = min_count_cpm1)
-      ## Use the intersection of both filters (most conservative)
-      keep <- keep_cpm & keep_expr
       cat("[FILTER] edgeR::filterByExpr (min.count=", min_count_cpm1,
           ") keeps:", sum(keep_expr), "\n", sep = "")
-      cat("[FILTER] Intersection of CPM + filterByExpr:", sum(keep), "\n")
-    } else {
-      keep <- keep_cpm
-      cat("[FILTER] edgeR not available; using CPM filter only\n")
+      if (filter_mode == "filterByExpr") {
+        keep <- keep_expr
+      } else if (filter_mode == "intersection") {
+        keep <- keep_cpm & keep_expr
+      }
+    } else if (filter_mode == "filterByExpr") {
+      cat("[FILTER] edgeR not available; falling back to CPM filter\n")
     }
+
+    cat("[FILTER] Mode:", filter_mode, "| kept", sum(keep), "genes after filtering\n")
 
     ## Apply filter back to full SE (must index into original row space)
     keep_names <- rownames(counts_mat_nz)[keep]
@@ -931,6 +1127,8 @@ tryCatch({
         "(removed", nrow(se) - nrow(se_filt), ")\n")
   } else {
     se_filt <- se
+    cat("[FILTER] Mode:", ifelse(LOW_COUNT_FILTER, filter_mode, "disabled"),
+        "-> using unfiltered gene set\n")
   }
 
   sanity$n_genes_after_id_filter <- nrow(se)  # no separate ID filter; same as raw
@@ -944,7 +1142,7 @@ tryCatch({
   ## B1. Dimension check
   cat("[B1] Filtered matrix: ", nrow(se_filt), " genes x ", ncol(se_filt), " samples\n", sep = "")
 
-  ## B2. Hard cap — if still >30K genes, something is wrong; do a second-pass
+  ## B2. Hard cap  if still >30K genes, something is wrong; do a second-pass
   MAX_GENES_FOR_DESEQ <- 30000
   if (nrow(se_filt) > MAX_GENES_FOR_DESEQ) {
     cat("[B2] WARNING: ", nrow(se_filt), " genes exceeds hard cap of ",
@@ -990,7 +1188,7 @@ tryCatch({
 
   cat("--- END SANITY BLOCK B ---\n\n")
 
-  ## ---- 4.3) DESeq2 — paired design ----------------------
+  ## ---- 4.3) DESeq2  paired design ----------------------
   cat("\n== 4.3  DESeq2 paired analysis ==\n")
 
   ## Sanity block C: Pre-DESeq2 diagnostics
@@ -1012,13 +1210,19 @@ tryCatch({
   mem_est_mb <- (8 * n_genes_for_deseq * n_samples_for_deseq * 6) / (1024^2)
   cat("[C2] Estimated DESeq2 memory: ~", round(mem_est_mb, 0), " MB for core matrices\n", sep = "")
   avail_mem <- tryCatch({
-    meminfo <- readLines("/proc/meminfo", n = 3)
-    avail_line <- grep("MemAvailable", meminfo, value = TRUE)
-    if (length(avail_line) > 0) {
-      avail_kb <- as.numeric(gsub("[^0-9]", "", avail_line))
-      round(avail_kb / 1024)
-    } else NA
-  }, error = function(e) NA)
+    if (!file.exists("/proc/meminfo")) {
+      NA_real_
+    } else {
+      meminfo <- suppressWarnings(readLines("/proc/meminfo", n = 3))
+      avail_line <- grep("MemAvailable", meminfo, value = TRUE)
+      if (length(avail_line) > 0) {
+        avail_kb <- as.numeric(gsub("[^0-9]", "", avail_line))
+        round(avail_kb / 1024)
+      } else {
+        NA_real_
+      }
+    }
+  }, error = function(e) NA_real_)
   if (!is.na(avail_mem)) {
     cat("[C2] Available system memory: ~", avail_mem, " MB\n", sep = "")
     if (mem_est_mb > avail_mem * 0.5) {
@@ -1057,7 +1261,7 @@ tryCatch({
         vst_cache_path <- file.path(cache_dir, "vst_counts.rds")
         if (file.exists(vst_cache_path)) file.remove(vst_cache_path)
       } else {
-        cat("[C4] Cache gene count matches (", cached_ngenes, ") — using cache\n", sep = "")
+        cat("[C4] Cache gene count matches (", cached_ngenes, ")  using cache\n", sep = "")
       }
       rm(cached_dds)
     }
@@ -1074,7 +1278,7 @@ tryCatch({
   ## ---- Sanity block D: Post-DESeq2 model diagnostics ----
   cat("\n--- SANITY BLOCK D: DESeq2 model diagnostics ---\n")
 
-  ## D1. Size factors — should be ~0.5-2.0 for most samples.
+  ## D1. Size factors  should be ~0.5-2.0 for most samples.
   ##     Extreme values indicate library-size or composition problems.
   sf <- sizeFactors(dds)
   cat("[D1] Size factors:\n")
@@ -1085,11 +1289,11 @@ tryCatch({
     cat("[D1] WARNING: Extreme size factors in:", paste(sf_outliers, collapse = ", "), "\n")
     cat("     This may indicate failed library prep or contamination.\n")
   } else {
-    cat("[D1] OK — all size factors within normal range (0.1-10)\n")
+    cat("[D1] OK  all size factors within normal range (0.1-10)\n")
   }
   sanity$size_factor_range <- paste0(round(min(sf), 3), "-", round(max(sf), 3))
 
-  ## D2. Dispersion estimates — check for unusual patterns.
+  ## D2. Dispersion estimates  check for unusual patterns.
   ##     Median dispersion for human RNA-seq is typically 0.01-0.3.
   dispersions <- mcols(dds)$dispGeneEst
   dispersions <- dispersions[!is.na(dispersions)]
@@ -1104,20 +1308,20 @@ tryCatch({
     if (median(dispersions) > 1) {
       cat("[D2] WARNING: High median dispersion suggests noisy data or poor model fit.\n")
     } else {
-      cat("[D2] OK — dispersion range typical for human tissue RNA-seq\n")
+      cat("[D2] OK  dispersion range typical for human tissue RNA-seq\n")
     }
   }
 
-  ## D3. Convergence — check for genes where DESeq2 maxed out iterations.
+  ## D3. Convergence  check for genes where DESeq2 maxed out iterations.
   n_not_converged <- sum(mcols(dds)$betaConv == FALSE, na.rm = TRUE)
   cat("[D3] Genes that did not converge:", n_not_converged, "of", nrow(dds), "\n")
   if (n_not_converged > nrow(dds) * 0.05) {
     cat("[D3] WARNING: >5% non-convergence. Model may be mis-specified.\n")
   } else {
-    cat("[D3] OK — convergence rate normal\n")
+    cat("[D3] OK  convergence rate normal\n")
   }
 
-  ## D4. Cook's distance — flag outlier samples that dominate results.
+  ## D4. Cook's distance  flag outlier samples that dominate results.
   ##     High Cook's for many genes in one sample = probable outlier.
   cooks_mat <- assays(dds)[["cooks"]]
   if (!is.null(cooks_mat)) {
@@ -1140,7 +1344,7 @@ tryCatch({
           paste(high_cooks, collapse = ", "), "\n", sep = "")
       cat("     Consider removing these outliers and re-running.\n")
     } else {
-      cat("[D4] OK — no sample-level outliers by Cook's distance\n")
+      cat("[D4] OK  no sample-level outliers by Cook's distance\n")
     }
   }
 
@@ -1204,7 +1408,7 @@ tryCatch({
     cat("     Possible batch effects, misspecified model, or violated assumptions.\n")
     sanity$pval_distribution <- "ANTI_CONSERVATIVE"
   } else {
-    cat("[E3] OK — p-value distribution looks healthy (spike near 0, flat elsewhere)\n")
+    cat("[E3] OK  p-value distribution looks healthy (spike near 0, flat elsewhere)\n")
     sanity$pval_distribution <- "HEALTHY"
   }
 
@@ -1223,16 +1427,33 @@ tryCatch({
   sanity$n_up_wat <- sum(res_df$padj < PADJ_CUTOFF &
                           res_df$log2FoldChange <= -LFC_CUTOFF, na.rm = TRUE)
 
-  ## Compare to paper
+  ## ---- 4.3b) Sensitivity model (unpaired) -----------------
+  cat("\n== 4.3b  DESeq2 sensitivity model (unpaired) ==\n")
+  dds_unpaired <- DESeqDataSet(se_filt, design = ~ tissue)
+  dds_unpaired$tissue <- relevel(dds_unpaired$tissue, ref = CONDITION_REF)
+  dds_unpaired <- DESeq(dds_unpaired, quiet = TRUE)
+  res_unpaired <- results(dds_unpaired,
+                          contrast = c("tissue", CONDITION_TEST, CONDITION_REF),
+                          alpha = PADJ_CUTOFF)
+  res_unpaired_df <- as.data.frame(res_unpaired) %>%
+    rownames_to_column("gene_id") %>%
+    arrange(padj)
+
+  sanity$n_up_bat_unpaired <- sum(res_unpaired_df$padj < PADJ_CUTOFF &
+                                   res_unpaired_df$log2FoldChange >= LFC_CUTOFF, na.rm = TRUE)
+  sanity$n_up_wat_unpaired <- sum(res_unpaired_df$padj < PADJ_CUTOFF &
+                                   res_unpaired_df$log2FoldChange <= -LFC_CUTOFF, na.rm = TRUE)
+  cat("[OK] Unpaired model complete:", nrow(res_unpaired_df), "genes tested\n")
+  cat("     Up in BAT (padj <", PADJ_CUTOFF, ", LFC >=", LFC_CUTOFF, "):",
+      sanity$n_up_bat_unpaired, "\n")
+  cat("     Up in WAT (padj <", PADJ_CUTOFF, ", LFC <=", -LFC_CUTOFF, "):",
+      sanity$n_up_wat_unpaired, "\n")
+
+  ## Report paper mismatch without data-driven subject exclusion
   cat("[PAPER] Virtanen et al. report", EXPECTED_UP_BAT,
-      "BAT-enriched genes (14 subjects)\n")
-  cat("[PAPER] This run:", sanity$n_up_bat, "BAT-enriched genes (",
-      nlevels(se_filt$subject), "subjects)\n")
-  if (abs(sanity$n_up_bat - EXPECTED_UP_BAT) / EXPECTED_UP_BAT <= DEG_COUNT_TOLERANCE) {
-    cat("[PAPER] Within", DEG_COUNT_TOLERANCE * 100, "% tolerance\n")
-  } else {
-    cat("[PAPER] Outside tolerance — may reflect different subject count or filtering\n")
-  }
+      "BAT-enriched genes from 14 subjects; this script keeps all paired subjects by default.\n")
+  cat("[PAPER] Current cohort:", nlevels(se_filt$subject), "subjects |",
+      ncol(se_filt), "samples\n")
 
   ## ---- 4.4) Gene symbol mapping --------------------------
   cat("\n== 4.4  Mapping gene IDs to symbols ==\n")
@@ -1253,19 +1474,23 @@ tryCatch({
       multiVals = "first"
     )
     res_df$symbol <- gene_symbols[res_df$gene_id_clean]
+    res_unpaired_df$gene_id_clean <- gsub("\\.\\d+$", "", res_unpaired_df$gene_id)
+    res_unpaired_df$symbol <- gene_symbols[res_unpaired_df$gene_id_clean]
     n_mapped <- sum(!is.na(res_df$symbol))
   } else {
     ## Gene IDs are already symbols (e.g. GEO humanBATWAT.txt)
     res_df$symbol <- res_df$gene_id
+    res_unpaired_df$symbol <- res_unpaired_df$gene_id
     n_mapped <- sum(res_df$symbol != "")
   }
 
   ## Fill NA symbols with gene_id
   res_df$symbol[is.na(res_df$symbol)] <- res_df$gene_id[is.na(res_df$symbol)]
+  res_unpaired_df$symbol[is.na(res_unpaired_df$symbol)] <- res_unpaired_df$gene_id[is.na(res_unpaired_df$symbol)]
 
   cat("[OK] Mapped", n_mapped, "of", nrow(res_df), "genes to HGNC symbols\n")
 
-  ## ---- 4.5) CLDN1 — the primary question -----------------
+  ## ---- 4.5) CLDN1  the primary question -----------------
   cat("\n")
   cat("##########################################################\n")
   cat("##  PRIMARY QUERY: Is CLDN1 increased in human BAT?     ##\n")
@@ -1295,7 +1520,7 @@ tryCatch({
 
     if (!is.na(cldn1$padj) && cldn1$padj < PADJ_CUTOFF &&
         cldn1$log2FoldChange > 0) {
-      cat("  >>> VERDICT: YES — CLDN1 is SIGNIFICANTLY INCREASED in BAT\n")
+      cat("  >>> VERDICT: YES  CLDN1 is SIGNIFICANTLY INCREASED in BAT\n")
       if (cldn1$log2FoldChange >= LFC_CUTOFF) {
         cat("      (meets both padj and log2FC thresholds)\n")
       } else {
@@ -1303,12 +1528,12 @@ tryCatch({
       }
       sanity$cldn1_verdict <- "UP_IN_BAT_SIGNIFICANT"
     } else if (!is.na(cldn1$log2FoldChange) && cldn1$log2FoldChange > 0) {
-      cat("  >>> VERDICT: TREND — CLDN1 shows a positive fold-change in BAT\n")
+      cat("  >>> VERDICT: TREND  CLDN1 shows a positive fold-change in BAT\n")
       cat("      but does NOT reach statistical significance (padj =",
           signif(cldn1$padj, 3), ")\n")
       sanity$cldn1_verdict <- "UP_TREND_NOT_SIGNIFICANT"
     } else if (!is.na(cldn1$log2FoldChange) && cldn1$log2FoldChange < 0) {
-      cat("  >>> VERDICT: NO — CLDN1 is LOWER in BAT than WAT\n")
+      cat("  >>> VERDICT: NO  CLDN1 is LOWER in BAT than WAT\n")
       cat("      (log2FC =", round(cldn1$log2FoldChange, 3), ")\n")
       sanity$cldn1_verdict <- "DOWN_IN_BAT"
     } else {
@@ -1319,7 +1544,24 @@ tryCatch({
 
   cat("\n##########################################################\n\n")
 
-  ## ---- 4.5b) UCP1 — positive control ----------------------
+  ## Unpaired sensitivity key-gene lines
+  cat("[SENS] Unpaired model key genes:\n")
+  for (kg in c("CLDN1", "UCP1")) {
+    row_u <- res_unpaired_df[res_unpaired_df$symbol == kg, ]
+    if (nrow(row_u) > 0) {
+      row_u <- row_u[1, ]
+      cat(sprintf("  %-6s | log2FC=%+0.3f | p=%s | padj=%s | baseMean=%0.1f\n",
+                  kg,
+                  row_u$log2FoldChange,
+                  formatC(row_u$pvalue, format = "e", digits = 3),
+                  formatC(row_u$padj, format = "e", digits = 3),
+                  row_u$baseMean))
+    } else {
+      cat(" ", kg, "| not found in unpaired model output\n")
+    }
+  }
+
+  ## ---- 4.5b) UCP1  positive control ----------------------
   cat("\n")
   cat("##########################################################\n")
   cat("##  CONTROL: UCP1 expression (canonical BAT marker)     ##\n")
@@ -1328,7 +1570,7 @@ tryCatch({
   ucp1_row <- res_df[res_df$symbol == "UCP1", ]
 
   if (nrow(ucp1_row) == 0) {
-    cat("[!!] UCP1 NOT FOUND — this is unexpected for BAT/WAT data\n")
+    cat("[!!] UCP1 NOT FOUND  this is unexpected for BAT/WAT data\n")
     sanity$ucp1_found   <- FALSE
     sanity$ucp1_verdict <- "NOT_DETECTED"
   } else {
@@ -1358,7 +1600,7 @@ tryCatch({
       cat("  >>> CONTROL WARNING: UCP1 trends up but is not significant\n")
       sanity$ucp1_verdict <- "UP_TREND_NOT_SIGNIFICANT"
     } else {
-      cat("  >>> CONTROL WARNING: UCP1 not up in BAT — check data integrity\n")
+      cat("  >>> CONTROL WARNING: UCP1 not up in BAT  check data integrity\n")
       sanity$ucp1_verdict <- "UNEXPECTED"
     }
   }
@@ -1427,11 +1669,12 @@ tryCatch({
 
   vst_mat <- assay(vsd)
   cat("[OK] VST matrix:", nrow(vst_mat), "genes x", ncol(vst_mat), "samples\n")
+  tissue_vec <- as.character(colData(dds)$tissue)
 
   ## ---- Sanity block F: Sample-level QC (on VST data) ----
   cat("\n--- SANITY BLOCK F: Sample-level QC ---\n")
 
-  ## F1. Inter-sample Spearman correlation — should be high (>0.8)
+  ## F1. Inter-sample Spearman correlation  should be high (>0.8)
   ##     within tissue, lower between tissues.
   if (ncol(vst_mat) <= 100) {  # skip for very large designs
     cor_mat <- cor(vst_mat, method = "spearman")
@@ -1449,7 +1692,7 @@ tryCatch({
         if (min(within_cors, na.rm = TRUE) < 0.8) {
           low_pairs <- which(cor_mat[idx, idx] < 0.8 & upper.tri(cor_mat[idx, idx]), arr.ind = TRUE)
           cat("[F1] WARNING: Low within-group correlation in ", tis,
-              " — possible outlier sample(s)\n", sep = "")
+              "  possible outlier sample(s)\n", sep = "")
         }
       }
     }
@@ -1465,7 +1708,7 @@ tryCatch({
     }
   }
 
-  ## F2. PCA variance — PC1 should capture tissue effect.
+  ## F2. PCA variance  PC1 should capture tissue effect.
   ##     If PC1 variance is <10%, the tissue signal may be weak.
   pca_obj <- prcomp(t(vst_mat), center = TRUE, scale. = FALSE)
   pct_var <- round(100 * (pca_obj$sdev^2 / sum(pca_obj$sdev^2)), 1)
@@ -1485,7 +1728,7 @@ tryCatch({
         cat("[F2] WARNING: PC1 does NOT significantly separate tissues.\n")
         cat("     Tissue effect may be weak or confounded by batch/subject effects.\n")
       } else {
-        cat("[F2] OK — PC1 clearly separates BAT from WAT\n")
+        cat("[F2] OK  PC1 clearly separates BAT from WAT\n")
       }
     }
   }
@@ -1511,27 +1754,213 @@ tryCatch({
     }
   }
 
+  ## ---- SANITY BLOCK C: tissue identity / contamination checks ----
+  cat("\n--- SANITY BLOCK C: Tissue identity and contamination checks ---\n")
+  z_vst <- t(scale(t(vst_mat)))
+  z_vst[is.na(z_vst)] <- 0
+
+  bat_marker_present <- intersect(BAT_MARKER_GENES, rownames(z_vst))
+  wat_marker_present <- intersect(WAT_MARKER_GENES, rownames(z_vst))
+  bat_score <- if (length(bat_marker_present) > 0) colMeans(z_vst[bat_marker_present, , drop = FALSE]) else rep(NA_real_, ncol(z_vst))
+  wat_score <- if (length(wat_marker_present) > 0) colMeans(z_vst[wat_marker_present, , drop = FALSE]) else rep(NA_real_, ncol(z_vst))
+  ucp1_vst <- if ("UCP1" %in% rownames(vst_mat)) as.numeric(vst_mat["UCP1", ]) else rep(NA_real_, ncol(vst_mat))
+  muscle_markers <- intersect(c("ACTA1", "MYH7", "ACTC1"), rownames(z_vst))
+  muscle_score <- if (length(muscle_markers) > 0) colMeans(z_vst[muscle_markers, , drop = FALSE]) else rep(NA_real_, ncol(z_vst))
+
+  bat_low <- quantile(bat_score, 0.10, na.rm = TRUE)
+  bat_high <- quantile(bat_score, 0.90, na.rm = TRUE)
+  ucp1_low <- quantile(ucp1_vst, 0.10, na.rm = TRUE)
+  ucp1_high <- quantile(ucp1_vst, 0.90, na.rm = TRUE)
+
+  marker_scores <- data.frame(
+    sample_id = colnames(vst_mat),
+    subject = as.character(colData(dds)$subject_label),
+    tissue = tissue_vec,
+    BAT_score = as.numeric(bat_score),
+    WAT_score = as.numeric(wat_score),
+    UCP1_vst = as.numeric(ucp1_vst),
+    muscle_score = as.numeric(muscle_score),
+    swap_flag = (tissue_vec == CONDITION_TEST & (bat_score <= bat_low | ucp1_vst <= ucp1_low)) |
+      (tissue_vec == CONDITION_REF & (bat_score >= bat_high | ucp1_vst >= ucp1_high)),
+    stringsAsFactors = FALSE
+  )
+  write.csv(marker_scores, file.path(outdir, "tables", "marker_scores.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "marker_scores.csv"), "Marker scores")
+  flagged_swaps <- marker_scores[isTRUE(marker_scores$swap_flag) | marker_scores$swap_flag, ]
+  if (nrow(flagged_swaps) > 0) {
+    cat("[C] Potential swap/mislabeled samples flagged:\n")
+    print(flagged_swaps[, c("sample_id", "subject", "tissue", "BAT_score", "UCP1_vst")])
+  } else {
+    cat("[C] No marker-based swap flags detected.\n")
+  }
+  if (any(!is.na(marker_scores$muscle_score))) {
+    cat("[C] Top 3 muscle-score samples:\n")
+    print(head(marker_scores[order(-marker_scores$muscle_score), c("sample_id", "tissue", "muscle_score")], 3))
+  }
+
+  ## ---- SANITY BLOCK D: PCA association and outliers ----
+  cat("\n--- SANITY BLOCK D2: PCA association and outlier flags ---\n")
+  pca_scores <- data.frame(
+    sample_id = colnames(vst_mat),
+    subject = as.character(colData(dds)$subject_label),
+    tissue = tissue_vec,
+    BAT_status = as.character(bat_status_by_sample[colnames(vst_mat)]),
+    PC1 = pca_obj$x[, 1],
+    PC2 = pca_obj$x[, 2],
+    stringsAsFactors = FALSE
+  )
+  write.csv(pca_scores, file.path(outdir, "tables", "pca_scores.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "pca_scores.csv"), "PCA scores")
+
+  pc_assoc <- data.frame(term = character(0), p_value = numeric(0), direction = character(0), stringsAsFactors = FALSE)
+  if (length(unique(pca_scores$tissue)) == 2) {
+    t1 <- t.test(PC1 ~ tissue, data = pca_scores)
+    t2 <- t.test(PC2 ~ tissue, data = pca_scores)
+    pc_assoc <- bind_rows(pc_assoc,
+                          data.frame(term = "PC1~tissue", p_value = t1$p.value,
+                                     direction = paste(names(sort(tapply(pca_scores$PC1, pca_scores$tissue, mean), decreasing = TRUE))[1], "higher")),
+                          data.frame(term = "PC2~tissue", p_value = t2$p.value,
+                                     direction = paste(names(sort(tapply(pca_scores$PC2, pca_scores$tissue, mean), decreasing = TRUE))[1], "higher")))
+  }
+  if (sum(!is.na(pca_scores$BAT_status)) > 0 && length(unique(na.omit(pca_scores$BAT_status))) > 1) {
+    tmp <- pca_scores[!is.na(pca_scores$BAT_status), ]
+    b1 <- tryCatch(t.test(PC1 ~ BAT_status, data = tmp)$p.value, error = function(e) NA_real_)
+    b2 <- tryCatch(t.test(PC2 ~ BAT_status, data = tmp)$p.value, error = function(e) NA_real_)
+    pc_assoc <- bind_rows(pc_assoc,
+                          data.frame(term = "PC1~BAT_status", p_value = b1, direction = "status-associated"),
+                          data.frame(term = "PC2~BAT_status", p_value = b2, direction = "status-associated"))
+  }
+  print(pc_assoc)
+
+  outlier_rows <- list()
+  for (tis in unique(tissue_vec)) {
+    idx <- which(tissue_vec == tis)
+    if (length(idx) >= 3) {
+      mat <- t(vst_mat[, idx, drop = FALSE])
+      cen <- colMeans(mat)
+      dst <- sqrt(rowSums((mat - matrix(cen, nrow = nrow(mat), ncol = ncol(mat), byrow = TRUE))^2))
+      thr <- as.numeric(quantile(dst, 0.95, na.rm = TRUE))
+      outlier_rows[[tis]] <- data.frame(sample_id = colnames(vst_mat)[idx], tissue = tis,
+                                        dist_to_centroid = dst, threshold_95 = thr,
+                                        outlier_flag = dst > thr, stringsAsFactors = FALSE)
+    }
+  }
+  outlier_flags <- bind_rows(outlier_rows)
+  write.csv(outlier_flags, file.path(outdir, "tables", "outlier_flags.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "outlier_flags.csv"), "Outlier flags")
+
   cat("--- END SANITY BLOCK F ---\n\n")
 
   ## ---- 4.8) Save full DE table ---------------------------
   cat("\n== 4.8  Saving results tables ==\n")
 
-  de_file <- paste0("DE_BAT_vs_WAT_", run_tag, ".csv")
-  write.csv(res_df, file = file.path(outdir, "tables", de_file),
-            row.names = FALSE)
-  cat("[SAVED]", de_file, "\n")
-  verify_output_file(file.path(outdir, "tables", de_file), "DE full CSV")
+  de_file_paired <- "DE_BAT_vs_WAT_paired.csv"
+  de_file_unpaired <- "DE_BAT_vs_WAT_unpaired.csv"
+  write.csv(res_df, file = file.path(outdir, "tables", de_file_paired), row.names = FALSE)
+  write.csv(res_unpaired_df, file = file.path(outdir, "tables", de_file_unpaired), row.names = FALSE)
+  cat("[SAVED]", de_file_paired, "\n")
+  cat("[SAVED]", de_file_unpaired, "\n")
+  verify_output_file(file.path(outdir, "tables", de_file_paired), "DE paired CSV")
+  verify_output_file(file.path(outdir, "tables", de_file_unpaired), "DE unpaired CSV")
 
-  ## DEG-only table
-  deg_df <- res_df %>%
-    filter(!is.na(padj), padj < PADJ_CUTOFF, abs(log2FoldChange) >= LFC_CUTOFF)
+  deg_df <- res_df %>% filter(!is.na(padj), padj < PADJ_CUTOFF, abs(log2FoldChange) >= LFC_CUTOFF)
+  deg_df_unpaired <- res_unpaired_df %>% filter(!is.na(padj), padj < PADJ_CUTOFF, abs(log2FoldChange) >= LFC_CUTOFF)
+  deg_df_padj_only <- res_df %>% filter(!is.na(padj), padj < PADJ_CUTOFF)
+  deg_df_unpaired_padj_only <- res_unpaired_df %>% filter(!is.na(padj), padj < PADJ_CUTOFF)
 
-  deg_file <- paste0("DEGs_BAT_vs_WAT_padj", PADJ_CUTOFF,
-                      "_lfc", LFC_CUTOFF, "_", run_tag, ".csv")
-  write.csv(deg_df, file = file.path(outdir, "tables", deg_file),
-            row.names = FALSE)
-  cat("[SAVED]", deg_file, "(", nrow(deg_df), "DEGs )\n")
-  verify_output_file(file.path(outdir, "tables", deg_file), "DEG CSV")
+  ## ---- SANITY BLOCK E: DEG-threshold reconciliation ----
+  deg_sensitivity <- bind_rows(
+    data.frame(model = "paired", definition = "padj<0.05 & |LFC|>=1",
+               n_up_bat = sum(res_df$padj < 0.05 & res_df$log2FoldChange >= 1, na.rm = TRUE),
+               n_up_wat = sum(res_df$padj < 0.05 & res_df$log2FoldChange <= -1, na.rm = TRUE)),
+    data.frame(model = "paired", definition = "pvalue<0.05 & |LFC|>=1",
+               n_up_bat = sum(res_df$pvalue < 0.05 & res_df$log2FoldChange >= 1, na.rm = TRUE),
+               n_up_wat = sum(res_df$pvalue < 0.05 & res_df$log2FoldChange <= -1, na.rm = TRUE)),
+    data.frame(model = "paired", definition = "padj<0.05 & LFC>0",
+               n_up_bat = sum(res_df$padj < 0.05 & res_df$log2FoldChange > 0, na.rm = TRUE),
+               n_up_wat = sum(res_df$padj < 0.05 & res_df$log2FoldChange < 0, na.rm = TRUE)),
+    data.frame(model = "paired", definition = "padj<0.1 & LFC>0",
+               n_up_bat = sum(res_df$padj < 0.1 & res_df$log2FoldChange > 0, na.rm = TRUE),
+               n_up_wat = sum(res_df$padj < 0.1 & res_df$log2FoldChange < 0, na.rm = TRUE)),
+    data.frame(model = "paired", definition = "padj<0.05 only",
+               n_up_bat = sum(res_df$padj < 0.05 & res_df$log2FoldChange > 0, na.rm = TRUE),
+               n_up_wat = sum(res_df$padj < 0.05 & res_df$log2FoldChange < 0, na.rm = TRUE)),
+    data.frame(model = "unpaired", definition = "padj<0.05 & |LFC|>=1",
+               n_up_bat = sum(res_unpaired_df$padj < 0.05 & res_unpaired_df$log2FoldChange >= 1, na.rm = TRUE),
+               n_up_wat = sum(res_unpaired_df$padj < 0.05 & res_unpaired_df$log2FoldChange <= -1, na.rm = TRUE)),
+    data.frame(model = "unpaired", definition = "pvalue<0.05 & |LFC|>=1",
+               n_up_bat = sum(res_unpaired_df$pvalue < 0.05 & res_unpaired_df$log2FoldChange >= 1, na.rm = TRUE),
+               n_up_wat = sum(res_unpaired_df$pvalue < 0.05 & res_unpaired_df$log2FoldChange <= -1, na.rm = TRUE)),
+    data.frame(model = "unpaired", definition = "padj<0.05 & LFC>0",
+               n_up_bat = sum(res_unpaired_df$padj < 0.05 & res_unpaired_df$log2FoldChange > 0, na.rm = TRUE),
+               n_up_wat = sum(res_unpaired_df$padj < 0.05 & res_unpaired_df$log2FoldChange < 0, na.rm = TRUE)),
+    data.frame(model = "unpaired", definition = "padj<0.1 & LFC>0",
+               n_up_bat = sum(res_unpaired_df$padj < 0.1 & res_unpaired_df$log2FoldChange > 0, na.rm = TRUE),
+               n_up_wat = sum(res_unpaired_df$padj < 0.1 & res_unpaired_df$log2FoldChange < 0, na.rm = TRUE)),
+    data.frame(model = "unpaired", definition = "padj<0.05 only",
+               n_up_bat = sum(res_unpaired_df$padj < 0.05 & res_unpaired_df$log2FoldChange > 0, na.rm = TRUE),
+               n_up_wat = sum(res_unpaired_df$padj < 0.05 & res_unpaired_df$log2FoldChange < 0, na.rm = TRUE))
+  )
+  deg_sensitivity$distance_to_paper <- abs(deg_sensitivity$n_up_bat - EXPECTED_UP_BAT)
+  write.csv(deg_sensitivity, file.path(outdir, "tables", "deg_count_sensitivity_thresholds.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "deg_count_sensitivity_thresholds.csv"), "DEG sensitivity CSV")
+  best_def <- deg_sensitivity[which.min(deg_sensitivity$distance_to_paper), ]
+  cat("[E] Closest threshold to paper BAT-up", EXPECTED_UP_BAT, ":",
+      best_def$model, "|", best_def$definition, "|", best_def$n_up_bat, "genes\n")
+
+  ## ---- SANITY BLOCK G: bounded influential-subject re-fits ----
+  subject_delta <- marker_scores %>%
+    left_join(pca_scores[, c("sample_id", "PC1")], by = "sample_id") %>%
+    group_by(subject) %>%
+    summarise(deltaPC1 = diff(PC1[match(c(CONDITION_REF, CONDITION_TEST), tissue)]),
+              deltaBAT = diff(BAT_score[match(c(CONDITION_REF, CONDITION_TEST), tissue)]),
+              .groups = "drop")
+  subject_delta$deltaPC1[is.na(subject_delta$deltaPC1)] <- 0
+  subject_delta$deltaBAT[is.na(subject_delta$deltaBAT)] <- 0
+  subject_delta$influence_score <- abs(subject_delta$deltaPC1) + abs(subject_delta$deltaBAT)
+  top_influential <- head(subject_delta[order(-subject_delta$influence_score), "subject"], 3)
+  cat("[G] Top bounded influential subjects:", paste(top_influential, collapse = ", "), "\n")
+
+  influence_rows <- list()
+  for (sj in top_influential) {
+    keep <- colData(se_filt)$subject_label != sj
+    se_sub <- se_filt[, keep]
+    dds_sub <- DESeqDataSet(se_sub, design = ~ subject + tissue)
+    dds_sub$tissue <- relevel(dds_sub$tissue, ref = CONDITION_REF)
+    dds_sub <- DESeq(dds_sub, quiet = TRUE)
+    rr <- as.data.frame(results(dds_sub, contrast = c("tissue", CONDITION_TEST, CONDITION_REF), alpha = PADJ_CUTOFF)) %>%
+      rownames_to_column("gene_id")
+    rr$symbol <- rr$gene_id
+    cldn1_s <- extract_gene_line(rr, "CLDN1")
+    ucp1_s <- extract_gene_line(rr, "UCP1")
+    influence_rows[[length(influence_rows) + 1]] <- data.frame(
+      excluded_subject = sj,
+      n_up_bat = sum(rr$padj < PADJ_CUTOFF & rr$log2FoldChange >= LFC_CUTOFF, na.rm = TRUE),
+      n_up_wat = sum(rr$padj < PADJ_CUTOFF & rr$log2FoldChange <= -LFC_CUTOFF, na.rm = TRUE),
+      CLDN1_log2FC = cldn1_s$log2FoldChange,
+      CLDN1_padj = cldn1_s$padj,
+      UCP1_log2FC = ucp1_s$log2FoldChange,
+      UCP1_padj = ucp1_s$padj,
+      stringsAsFactors = FALSE
+    )
+  }
+  subject_influence_bounded <- bind_rows(influence_rows)
+  write.csv(subject_influence_bounded, file.path(outdir, "tables", "subject_influence_bounded.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "subject_influence_bounded.csv"), "Bounded subject influence")
+
+  write.csv(deg_df, file.path(outdir, "tables", "DEGs_paired_padj0.05_lfc1.csv"), row.names = FALSE)
+  write.csv(deg_df_unpaired, file.path(outdir, "tables", "DEGs_unpaired_padj0.05_lfc1.csv"), row.names = FALSE)
+  write.csv(deg_df_padj_only, file.path(outdir, "tables", "DEGs_paired_padj0.05.csv"), row.names = FALSE)
+  write.csv(deg_df_unpaired_padj_only, file.path(outdir, "tables", "DEGs_unpaired_padj0.05.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "DEGs_paired_padj0.05_lfc1.csv"), "DEGs paired")
+  verify_output_file(file.path(outdir, "tables", "DEGs_unpaired_padj0.05_lfc1.csv"), "DEGs unpaired")
+  verify_output_file(file.path(outdir, "tables", "DEGs_paired_padj0.05.csv"), "DEGs paired padj")
+  verify_output_file(file.path(outdir, "tables", "DEGs_unpaired_padj0.05.csv"), "DEGs unpaired padj")
+
+  if (nrow(excluded_samples_df) > 0) {
+    write.csv(excluded_samples_df, file.path(outdir, "tables", "excluded_samples.csv"), row.names = FALSE)
+    verify_output_file(file.path(outdir, "tables", "excluded_samples.csv"), "Excluded samples")
+  }
 
   ## CLDN1-specific table
   cldn1_file <- paste0("CLDN1_result_", run_tag, ".csv")
@@ -1557,6 +1986,30 @@ tryCatch({
   saveRDS(deg_lists, file = file.path(outdir, "tables", deg_lists_file))
   cat("[SAVED]", deg_lists_file, "\n")
   verify_output_file(file.path(outdir, "tables", deg_lists_file), "DEG list RDS")
+
+  ## Key genes summary across paired and unpaired models
+  key_genes <- unique(c("CLDN1", "UCP1", "PPARG", "LEP", "CLDN11", BAT_MARKER_GENES, WAT_MARKER_GENES))
+  key_paired <- res_df %>% filter(symbol %in% key_genes) %>% mutate(model = "paired")
+  key_unpaired <- res_unpaired_df %>% filter(symbol %in% key_genes) %>% mutate(model = "unpaired")
+  key_summary <- bind_rows(key_paired, key_unpaired) %>%
+    select(model, gene_id, symbol, baseMean, log2FoldChange, pvalue, padj)
+  write.csv(key_summary, file.path(outdir, "tables", "key_genes_summary.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "key_genes_summary.csv"), "Key genes summary")
+
+  ## QC summary table
+  qc_summary <- data.frame(
+    sample_id = colnames(dds),
+    subject = as.character(colData(dds)$subject_label),
+    tissue = as.character(colData(dds)$tissue),
+    lib_size_unscaled = as.numeric(lib_sizes_unscaled[colnames(dds)]),
+    lib_size_final = as.numeric(lib_sizes_scaled[colnames(dds)]),
+    size_factor = as.numeric(sizeFactors(dds)),
+    median_cooks = if (exists("cooks_df")) cooks_df$median_cooks[match(colnames(dds), cooks_df$sample)] else NA_real_,
+    mean_spearman = if (exists("cor_mat")) round(rowMeans(cor_mat, na.rm = TRUE), 4)[colnames(dds)] else NA_real_,
+    stringsAsFactors = FALSE
+  )
+  write.csv(qc_summary, file.path(outdir, "tables", "qc_summary.csv"), row.names = FALSE)
+  verify_output_file(file.path(outdir, "tables", "qc_summary.csv"), "QC summary")
 
   ## Save VST matrix for downstream parts
   vst_file <- paste0("VST_matrix_", run_tag, ".rds")
@@ -1596,31 +2049,64 @@ tryCatch({
       col             = c("grey80", "forestgreen", "royalblue", "red2")
     )
 
-    volcano_file <- paste0("Volcano_BAT_vs_WAT_CLDN1_", run_tag, ".png")
+    volcano_file <- "Volcano_BAT_vs_WAT_paired.png"
     ggsave(file.path(outdir, "plots", volcano_file), plot = volcano,
            width = VOLCANO_W, height = VOLCANO_H, dpi = PLOT_DPI)
     cat("[SAVED]", volcano_file, "\n")
     verify_output_file(file.path(outdir, "plots", volcano_file), "Volcano plot")
 
-    ## -- 4.9b) PCA (with subject labels for outlier identification) --
-    cat("[PLOT] PCA biplot (subject-labelled)\n")
+    volcano_unpaired <- EnhancedVolcano(
+      res_unpaired_df,
+      lab             = res_unpaired_df$symbol,
+      selectLab       = highlight_genes,
+      x               = "log2FoldChange",
+      y               = "padj",
+      pCutoff         = PADJ_CUTOFF,
+      FCcutoff        = LFC_CUTOFF,
+      title           = "BAT vs WAT (unpaired sensitivity)",
+      subtitle        = paste("CLDN1 highlighted | n =", ncol(se_filt), "samples"),
+      caption         = paste("Total genes:", nrow(res_unpaired_df)),
+      drawConnectors  = TRUE,
+      widthConnectors = 0.5,
+      colConnectors   = "grey30",
+      max.overlaps    = 30,
+      pointSize       = 1.5,
+      labSize         = 4.0,
+      col             = c("grey80", "forestgreen", "royalblue", "red2")
+    )
+    volcano_unpaired_file <- "Volcano_BAT_vs_WAT_unpaired.png"
+    ggsave(file.path(outdir, "plots", volcano_unpaired_file), plot = volcano_unpaired,
+           width = VOLCANO_W, height = VOLCANO_H, dpi = PLOT_DPI)
+    verify_output_file(file.path(outdir, "plots", volcano_unpaired_file), "Volcano unpaired")
+
+    ## -- 4.9b) PCA (tissue shape + BAT_status color if available) --
+    cat("[PLOT] PCA biplot (tissue shape + BAT_status color if available)\n")
 
     pca_data <- plotPCA(vsd, intgroup = c("tissue", "subject"), returnData = TRUE)
     pct_var  <- round(100 * attr(pca_data, "percentVar"))
+    pca_data$BAT_status <- as.character(bat_status_by_sample[rownames(pca_data)])
+    pca_data$subject_label <- as.character(colData(dds)$subject_label[match(rownames(pca_data), rownames(colData(dds)))])
 
-    p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, colour = tissue,
-                                   label = subject)) +
-      geom_point(size = 4, alpha = 0.8) +
-      ggrepel::geom_text_repel(size = 3, max.overlaps = 20,
-                                show.legend = FALSE) +
-      scale_colour_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
-      labs(
-        title = "PCA: BAT vs WAT (Virtanen 2018)",
-        x = paste0("PC1 (", pct_var[1], "% variance)"),
-        y = paste0("PC2 (", pct_var[2], "% variance)")
-      ) +
-      theme_bw(base_size = 14) +
-      theme(legend.position = "bottom")
+    if (any(!is.na(pca_data$BAT_status))) {
+      p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, colour = BAT_status, shape = tissue,
+                                    label = subject_label)) +
+        geom_point(size = 4, alpha = 0.8) +
+        ggrepel::geom_text_repel(size = 3, max.overlaps = 20, show.legend = FALSE) +
+        labs(title = "PCA: BAT vs WAT", x = paste0("PC1 (", pct_var[1], "% variance)"),
+             y = paste0("PC2 (", pct_var[2], "% variance)"), colour = "BAT_status") +
+        theme_bw(base_size = 14) +
+        theme(legend.position = "bottom")
+    } else {
+      p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, colour = tissue, shape = tissue,
+                                    label = subject_label)) +
+        geom_point(size = 4, alpha = 0.8) +
+        ggrepel::geom_text_repel(size = 3, max.overlaps = 20, show.legend = FALSE) +
+        scale_colour_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
+        labs(title = "PCA: BAT vs WAT", x = paste0("PC1 (", pct_var[1], "% variance)"),
+             y = paste0("PC2 (", pct_var[2], "% variance)")) +
+        theme_bw(base_size = 14) +
+        theme(legend.position = "bottom")
+    }
 
     pca_file <- paste0("PCA_BAT_vs_WAT_", run_tag, ".png")
     ggsave(file.path(outdir, "plots", pca_file), plot = p_pca,
@@ -1636,13 +2122,14 @@ tryCatch({
       cldn1_vst <- data.frame(
         expression = vst_mat[cldn1_id[1], ],
         tissue     = colData(dds)$tissue,
-        subject    = colData(dds)$subject
+        subject    = colData(dds)$subject_label
       )
 
       p_cldn1 <- ggplot(cldn1_vst, aes(x = tissue, y = expression, fill = tissue)) +
         geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
         geom_line(aes(group = subject), colour = "grey50", linewidth = 0.4) +
         geom_point(aes(colour = tissue), size = 3) +
+        geom_text(aes(label = subject), vjust = -0.6, size = 2.3) +
         scale_fill_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
         scale_colour_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
         labs(
@@ -1663,7 +2150,7 @@ tryCatch({
       cat("[SAVED]", cldn1_plot_file, "\n")
       verify_output_file(file.path(outdir, "plots", cldn1_plot_file), "CLDN1 boxplot")
     } else {
-      cat("[SKIP] CLDN1 not in VST matrix — cannot plot\n")
+      cat("[SKIP] CLDN1 not in VST matrix  cannot plot\n")
     }
 
     ## -- 4.9c2) UCP1 expression box plot (positive control) --
@@ -1674,13 +2161,14 @@ tryCatch({
       ucp1_vst <- data.frame(
         expression = vst_mat[ucp1_id[1], ],
         tissue     = colData(dds)$tissue,
-        subject    = colData(dds)$subject
+        subject    = colData(dds)$subject_label
       )
 
       p_ucp1 <- ggplot(ucp1_vst, aes(x = tissue, y = expression, fill = tissue)) +
         geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.5) +
         geom_line(aes(group = subject), colour = "grey50", linewidth = 0.4) +
         geom_point(aes(colour = tissue), size = 3) +
+        geom_text(aes(label = subject), vjust = -0.6, size = 2.3) +
         scale_fill_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
         scale_colour_manual(values = c("WAT" = "#2166AC", "BAT" = "#B2182B")) +
         labs(
@@ -1697,7 +2185,7 @@ tryCatch({
       cat("[SAVED]", ucp1_plot_file, "\n")
       verify_output_file(file.path(outdir, "plots", ucp1_plot_file), "UCP1 boxplot")
     } else {
-      cat("[SKIP] UCP1 not in VST matrix — cannot plot\n")
+      cat("[SKIP] UCP1 not in VST matrix  cannot plot\n")
     }
 
     ## -- 4.9c3) Correlation: CLDN1 vs UCP1 in BAT samples --
@@ -1745,7 +2233,7 @@ tryCatch({
       cat("[SAVED]", cor_file, "\n")
       verify_output_file(file.path(outdir, "plots", cor_file), "Correlation plot")
     } else {
-      cat("[SKIP] CLDN1 or UCP1 not found — cannot compute correlation\n")
+      cat("[SKIP] CLDN1 or UCP1 not found  cannot compute correlation\n")
     }
 
     ## -- 4.9d) Heatmap of top DEGs with CLDN1 marked ------
@@ -1856,6 +2344,9 @@ tryCatch({
     n_tested      = nrow(res_df),
     n_up_bat      = sanity$n_up_bat,
     n_up_wat      = sanity$n_up_wat,
+    n_tested_unpaired = nrow(res_unpaired_df),
+    n_up_bat_unpaired = sanity$n_up_bat_unpaired,
+    n_up_wat_unpaired = sanity$n_up_wat_unpaired,
     n_total_deg   = sanity$n_up_bat + sanity$n_up_wat,
     paper_up_bat  = EXPECTED_UP_BAT,
     ucp1_lfc      = ifelse(isTRUE(sanity$ucp1_found), round(sanity$ucp1_lfc, 4), NA),
@@ -1888,7 +2379,8 @@ tryCatch({
       "Genes after count filter (CPM>=1)",
       "Second-pass filter applied",
       "DESeq2 runtime (min)",
-      "BAT-enriched genes (paper: 463)",
+      "BAT-enriched genes paired (paper: 463)",
+      "BAT-enriched genes unpaired",
       "UCP1 verdict",
       "UCP1 log2FC",
       "UCP1 padj",
@@ -1905,6 +2397,7 @@ tryCatch({
       "FALSE (ideally)",
       "< 10",
       paste0(EXPECTED_UP_BAT, " +/- ", DEG_COUNT_TOLERANCE * 100, "%"),
+      "context-only sensitivity",
       "UP_IN_BAT_SIGNIFICANT",
       "> 0",
       "< 0.05",
@@ -1921,6 +2414,7 @@ tryCatch({
       ifelse(!is.null(sanity$second_pass_filter), sanity$second_pass_filter, "N/A"),
       ifelse(!is.null(sanity$deseq_runtime_min), sanity$deseq_runtime_min, "N/A"),
       sanity$n_up_bat,
+      sanity$n_up_bat_unpaired,
       ifelse(is.null(sanity$ucp1_verdict), "NA", sanity$ucp1_verdict),
       ifelse(isTRUE(sanity$ucp1_found), round(sanity$ucp1_lfc, 3), "NOT_FOUND"),
       ifelse(isTRUE(sanity$ucp1_found), signif(sanity$ucp1_padj, 4), "NOT_FOUND"),
@@ -2022,7 +2516,7 @@ if (length(plots_written) > 0) {
 
 cat("\n")
 cat("##########################################################\n")
-cat("##  DONE — Part 1 complete                              ##\n")
+cat("##  DONE  Part 1 complete                              ##\n")
 cat("##  Run directory: ", basename(outdir), "\n", sep = "")
 cat("##  UCP1  verdict: ", ifelse(is.null(sanity$ucp1_verdict), "NA",
                                    sanity$ucp1_verdict), "\n", sep = "")

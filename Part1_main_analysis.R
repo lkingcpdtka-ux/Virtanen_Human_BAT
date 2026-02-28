@@ -691,9 +691,13 @@ tryCatch({
     pdata <- pdata[keep_samples, , drop = FALSE]
 
     ## Build SummarizedExperiment
+    ## Use safe subject IDs for model-matrix column names (avoid DESeq2 note
+    ## about non-standard characters, e.g. diacritics in subject labels).
+    subject_safe <- normalize_sample_id(pdata$subject)
     col_data <- DataFrame(
       tissue  = factor(pdata$tissue, levels = c(CONDITION_REF, CONDITION_TEST)),
-      subject = factor(pdata$subject),
+      subject = factor(subject_safe),
+      subject_label = as.character(pdata$subject),
       row.names = rownames(pdata)
     )
 
@@ -1012,7 +1016,8 @@ tryCatch({
   mem_est_mb <- (8 * n_genes_for_deseq * n_samples_for_deseq * 6) / (1024^2)
   cat("[C2] Estimated DESeq2 memory: ~", round(mem_est_mb, 0), " MB for core matrices\n", sep = "")
   avail_mem <- tryCatch({
-    meminfo <- readLines("/proc/meminfo", n = 3)
+    if (!file.exists("/proc/meminfo")) return(NA_real_)
+    meminfo <- suppressWarnings(readLines("/proc/meminfo", n = 3))
     avail_line <- grep("MemAvailable", meminfo, value = TRUE)
     if (length(avail_line) > 0) {
       avail_kb <- as.numeric(gsub("[^0-9]", "", avail_line))
@@ -1273,19 +1278,32 @@ tryCatch({
     loso_tbl <- loso_tbl[order(loso_tbl$abs_delta_vs_paper,
                                -loso_tbl$n_up_bat,
                                loso_tbl$excluded_subject), ]
-
     best_match <- loso_tbl[1, ]
-    sanity$loso_best_subject <- best_match$excluded_subject
-    sanity$loso_best_up_bat  <- best_match$n_up_bat
+    best_abs_delta <- abs(best_match$n_up_bat - EXPECTED_UP_BAT)
     sanity$loso_bat_range <- paste0(min(loso_tbl$n_up_bat), "-", max(loso_tbl$n_up_bat))
     sanity$loso_bat_sd <- round(sd(loso_tbl$n_up_bat), 2)
 
     cat("[LOSO] BAT-up range across exclusions:",
         min(loso_tbl$n_up_bat), "to", max(loso_tbl$n_up_bat),
         "(SD", round(sd(loso_tbl$n_up_bat), 2), ")\n")
-    cat("[LOSO] Best match to paper (", EXPECTED_UP_BAT, ") is excluding subject '",
-        best_match$excluded_subject, "' -> ", best_match$n_up_bat,
-        " BAT-up genes\n", sep = "")
+
+    if ((best_abs_delta / EXPECTED_UP_BAT) <= DEG_COUNT_TOLERANCE) {
+      sanity$loso_best_subject <- best_match$excluded_subject
+      sanity$loso_best_up_bat  <- best_match$n_up_bat
+      sanity$loso_match_quality <- "WITHIN_TOLERANCE"
+      cat("[LOSO] Plausible paper-match exclusion: subject '",
+          best_match$excluded_subject, "' -> ", best_match$n_up_bat,
+          " BAT-up genes\n", sep = "")
+    } else {
+      sanity$loso_best_subject <- NA_character_
+      sanity$loso_best_up_bat  <- NA_integer_
+      sanity$loso_match_quality <- "NO_CLOSE_MATCH"
+      cat("[LOSO] No single-subject exclusion reproduces paper DEG count within ",
+          DEG_COUNT_TOLERANCE * 100, "% tolerance.\n", sep = "")
+      cat("[LOSO] Closest exclusion was '", best_match$excluded_subject,
+          "' with ", best_match$n_up_bat,
+          " BAT-up genes (target ", EXPECTED_UP_BAT, ").\n", sep = "")
+    }
 
     if (sd(loso_tbl$n_up_bat) > 0 &&
         (max(loso_tbl$n_up_bat) - min(loso_tbl$n_up_bat)) > 2 * sd(loso_tbl$n_up_bat)) {
@@ -1298,6 +1316,9 @@ tryCatch({
     }
   } else {
     cat("[LOSO] Skipped (subject count outside 6-20 range)\n")
+    sanity$loso_best_subject <- NA_character_
+    sanity$loso_best_up_bat <- NA_integer_
+    sanity$loso_match_quality <- "SKIPPED"
     sanity$loso_bias_flag <- "SKIPPED"
   }
 
@@ -1307,9 +1328,13 @@ tryCatch({
   cat("[PAPER] This run:", sanity$n_up_bat, "BAT-enriched genes (",
       nlevels(se_filt$subject), "subjects)\n")
   if (!is.null(loso_tbl) && nrow(loso_tbl) > 0) {
-    cat("[PAPER] Closest 14-subject reconstruction: exclude",
-        sanity$loso_best_subject, "->", sanity$loso_best_up_bat,
-        "BAT-enriched genes\n")
+    if (!is.null(sanity$loso_best_subject) && !is.na(sanity$loso_best_subject)) {
+      cat("[PAPER] Closest 14-subject reconstruction: exclude",
+          sanity$loso_best_subject, "->", sanity$loso_best_up_bat,
+          "BAT-enriched genes\n")
+    } else {
+      cat("[PAPER] No plausible single-subject exclusion recovers published BAT-enriched count\n")
+    }
   }
   if (abs(sanity$n_up_bat - EXPECTED_UP_BAT) / EXPECTED_UP_BAT <= DEG_COUNT_TOLERANCE) {
     cat("[PAPER] Within", DEG_COUNT_TOLERANCE * 100, "% tolerance\n")
@@ -1959,6 +1984,8 @@ tryCatch({
                                         sanity$loso_best_subject, NA),
     loso_best_up_bat = ifelse(!is.null(sanity$loso_best_up_bat),
                               sanity$loso_best_up_bat, NA),
+    loso_match_quality = ifelse(!is.null(sanity$loso_match_quality),
+                                sanity$loso_match_quality, NA),
     loso_bias_flag = ifelse(!is.null(sanity$loso_bias_flag),
                             sanity$loso_bias_flag, NA),
     cldn1_ucp1_rho = ifelse(!is.null(sanity$cldn1_ucp1_rho),
@@ -1988,6 +2015,7 @@ tryCatch({
       "BAT-enriched genes (paper: 463)",
       "LOSO BAT-up range (exclude 1 subject)",
       "Best-match excluded subject (paper alignment)",
+      "LOSO paper-match quality",
       "LOSO bias stability flag",
       "UCP1 verdict",
       "UCP1 log2FC",
@@ -2006,8 +2034,9 @@ tryCatch({
       "< 10",
       paste0(EXPECTED_UP_BAT, " +/- ", DEG_COUNT_TOLERANCE * 100, "%"),
       "narrow range",
-      "paper-closest candidate",
-      "STABLE",
+      "subject ID or NA",
+      "WITHIN_TOLERANCE or NO_CLOSE_MATCH",
+      "STABLE or SENSITIVE",
       "UP_IN_BAT_SIGNIFICANT",
       "> 0",
       "< 0.05",
@@ -2025,7 +2054,8 @@ tryCatch({
       ifelse(!is.null(sanity$deseq_runtime_min), sanity$deseq_runtime_min, "N/A"),
       sanity$n_up_bat,
       ifelse(!is.null(sanity$loso_bat_range), sanity$loso_bat_range, "N/A"),
-      ifelse(!is.null(sanity$loso_best_subject), sanity$loso_best_subject, "N/A"),
+      ifelse(!is.null(sanity$loso_best_subject), sanity$loso_best_subject, "NA"),
+      ifelse(!is.null(sanity$loso_match_quality), sanity$loso_match_quality, "N/A"),
       ifelse(!is.null(sanity$loso_bias_flag), sanity$loso_bias_flag, "N/A"),
       ifelse(is.null(sanity$ucp1_verdict), "NA", sanity$ucp1_verdict),
       ifelse(isTRUE(sanity$ucp1_found), round(sanity$ucp1_lfc, 3), "NOT_FOUND"),
